@@ -1,0 +1,1615 @@
+---
+title: "LMM_BMI"
+output: html_document
+---
+
+This code was used in the analysis of Gamache et al. (2026) (https://link.springer.com/article/10.1007/s00125-026-06722-5). For the purpose of my analysis we did not use the sex-stratified results. 
+
+# _______________________________
+
+# Packages
+```{r}
+library(nlme)
+library(lme4)
+library("tidyverse")
+library(performance)
+library(reshape2)
+library(car)
+library(texreg)
+```
+# _______________________________
+
+# Functions:
+
+## Pre-process 
+
+This function will scale, stratify by sex (except if mentioned otherwise), and remove outliers (5SD)
+
+```{r}
+scaleTheVariableAndRemoveOutlier = function(mydata_long, phenotype, bySex =TRUE, remove_NA = TRUE) {
+  allData=c() # Will contain all the processed data
+  for (i in unique(mydata_long$time)) { # Iterate through each visit (time point)
+    if (bySex == TRUE) { # Sex-stratified 
+      # Male
+      dataM=mydata_long[mydata_long$time == i & mydata_long$sex==1,] # Extract male and this visit
+      dataM=dataM[!is.na(dataM[,phenotype]),] # Remove NA
+      meana = mean(dataM[, phenotype], na.rm = TRUE) # Get mean
+      sd = sd(dataM[, phenotype], na.rm = TRUE) # Get SD
+      
+      dataM=dataM[dataM[,phenotype]>= (meana - 5 * sd) & dataM[,phenotype]<= (meana + 5 * sd),]
+      dataM[,phenotype]=scale(dataM[,phenotype])
+      
+      allData=rbind(allData,dataM)
+      
+      # Female
+      dataF=mydata_long[mydata_long$time == i & mydata_long$sex==2,]
+      dataF=dataF[!is.na(dataF[,phenotype]),]
+      meana = mean(dataF[, phenotype], na.rm = TRUE)
+      sd = sd(dataF[, phenotype], na.rm = TRUE)
+      
+      dataF=dataF[dataF[,phenotype]>= (meana - 5 * sd) & dataF[,phenotype]<= (meana + 5 * sd),]
+      
+      dataF[,phenotype]=scale(dataF[,phenotype])
+      
+      allData=rbind(allData,dataF)
+      
+    } else{ # Not sex-stratified 
+      dataT=mydata_long[mydata_long$time == i,]
+      meana = mean(dataT[, phenotype], na.rm = TRUE)
+      sd = sd(dataT[, phenotype], na.rm = TRUE)
+      
+      dataT=dataT[dataT[,phenotype]>= (meana - 5 * sd) & dataT[,phenotype]<= (meana + 5 * sd),]
+      
+      dataT[,phenotype]=scale(dataT[,phenotype])
+      
+      allData=rbind(allData,dataT)
+    }
+    
+  allData[allData$time == i, 'time'] = round(mean(allData[allData$time == i, 'age_yrs'], na.rm = TRUE),digits=2) 
+  }
+  
+ # Remove NA
+  if(remove_NA){
+    mydata_long = allData[!is.na(allData[,phenotype]), ]
+  }
+  
+  mydata_long$time = mydata_long$time - min(mydata_long$time) 
+  
+  return(mydata_long)
+}
+
+```
+
+## Check 1: Mean outcome trajectory over time
+Calculate the mean outcome at each visit to assess the overall trajectory of the phenotype over time. This generates a plot, you need to verify if the mean across time seems constant. 
+```{r}
+check1_MeanAcrossTime <- function(mydata_long, phenotype) {
+  moy <- (aggregate(Phenotype ~ time, data = mydata_long, mean, na.rm = T))
+  colnames(moy)[2] = 'Phenotype' # outcome of interest
+  plot(
+    moy$time,
+    moy[, 'Phenotype'],
+    pch = 17,
+    xlab = 'Visit',
+    ylab = paste0(phenotype, ' z-score')
+  )
+  lines(moy$time, moy[, 'Phenotype'], lty = 2)
+  title(phenotype)
+}
+```
+
+## Check 2: Selection of the time trajectory
+Fit candidate linear models to determine whether the association between the phenotype and VAR changes linearly or non-linearly over time (time, time squared or interaction with time).
+
+```{r}
+check2_BestLinearModel <- function(mydata_long, allResult_S, var = 'NotSex', adjust_maternal_age = TRUE) {
+
+  # Will keep in memory if the model was evaluated
+  smod1 = FALSE
+  smod2 = FALSE
+  smod3 = FALSE
+  smod4 = FALSE
+  
+  mod1 = NULL
+  mod2 = NULL
+  mod3 = NULL
+  mod4 = NULL
+  
+  # Define covariates
+  covariates <- c()
+  
+  # Add sex when analysis is not sex-stratified and VAR is not sex
+  if (whichSex == 0 && var != 'sex') {
+    covariates <- c(covariates, "sex")
+  }
+  
+  # Add maternal age when required (when the analysis is not child specific)
+  if (adjust_maternal_age) {
+    covariates <- c(covariates, "AgeDelivery_Mom")
+  }
+  
+  # Construct the covariate portion of the model
+  covariates <- if (length(covariates) > 0) {
+    paste(covariates, collapse = " + ")
+  } else { "" }
+  
+  # MODEL 1: Linear association with time
+  formula1 <- as.formula(
+      paste("Phenotype ~ VAR + time",
+            ifelse(covariates != "", paste("+", covariates), ""))
+    )  
+  mod1 <- lm(formula1, data = mydata_long)
+  smod1 = TRUE # This model was estimated
+  
+  # MODEL 2: Add a quadratic time term 
+  # I(time^2) creates the squared time term directly within the model.
+  formula2 <- as.formula(
+    paste("Phenotype ~ VAR + time + I(time^2)",
+          ifelse(covariates != "", paste("+", covariates), ""))
+  )
+  mod2 <- lm(formula2, data = mydata_long)
+  smod2 = TRUE # This model was estimated
+  
+  # MODEL 3: Allow the effect of VAR to vary linearly over time
+  # The VAR * time interaction tests whether the association between VAR and the phenotype changes across visits.
+  formula3 <- as.formula(
+    paste("Phenotype ~ time * VAR + I(time^2)",
+          ifelse(covariates != "", paste("+", covariates), ""))
+  )
+  mod3 <- lm(formula3, data = mydata_long)
+  
+  # Determine whether the VAR × time interaction is statistically significant. Only if there is evidence that the effect of VAR changes over time do we proceed to the more complex Model 4.
+  
+  if (summary(mod3)$coefficient['time:VAR', 4] < 0.05) { 
+    smod3 = TRUE
+
+    # MODEL 4: Allow the effect of VAR to vary non-linearly over time
+    # Create a squared-time variable for use in Model 4.
+    mydata_long$timesq <- mydata_long$time^2
+    
+    formula4 <- as.formula(
+      paste("Phenotype ~ time * VAR + timesq * VAR",
+            ifelse(covariates != "", paste("+", covariates), ""))
+    )
+    
+    mod4 <- lm(formula4, data = mydata_long)
+
+    # Determine whether the VAR × time^2 interaction is statistically significant.
+    # If significant, Model 4 is retained as a candidate for BIC-based model selection. Otherwise, Model 4 is excluded.
+    if (summary(mod4)$coefficient['VAR:timesq', 4] < 0.05) { 
+      smod4 = TRUE
+      bic = BIC(mod1, mod2, mod3, mod4) 
+      best_model_linear = rownames(bic[which.min(bic$BIC), ])
+    } else{
+      bic = BIC(mod1, mod2, mod3) 
+      best_model_linear = rownames(bic[which.min(bic$BIC), ]) #
+    }
+  } else{
+    bic = BIC(mod1, mod2) 
+    best_model_linear = rownames(bic[which.min(bic$BIC), ]) 
+  }
+  
+  # Store the BIC value for each model. Models that were not evaluated will have NA because they are absent
+  # from the BIC table.
+  bmod1 = bic['mod1', 'BIC']
+  bmod2 = bic['mod2', 'BIC']
+  bmod3 = bic['mod3', 'BIC']
+  bmod4 = bic['mod4', 'BIC']
+  
+  allResult_S$bic_mod1 = bmod1
+  allResult_S$bic_mod2 = bmod2
+  allResult_S$bic_mod3 = bmod3
+  allResult_S$bic_mod4 = bmod4
+  
+  # Store the name of the best-fitting model for use in subsequent
+  # analyses.  
+  allResult_S$best_linear_model = best_model_linear
+  
+  out = list(
+    allResult_S = allResult_S,
+    smod1 = smod1,
+    smod2 = smod2,
+    smod3 = smod3,
+    smod4 = smod4,
+    mod1 = mod1,
+    mod2 = mod2,
+    mod3 = mod3,
+    mod4 = mod4
+  )
+  return(out)
+}
+```
+
+## Check 3: Predictions from candidate linear models
+Generate predicted phenotype values from each candidate model evaluated in Check 2 and compare them with the observed mean phenotype trajectory across visits. Predictions are generated only for models that were successfully fitted. The resulting plot shows how well each model captures the observed phenotype trajectory over time.
+
+```{r}
+check3_Prediction <- function(mydata_long, smod1, smod2, smod3, smod4, mod1, mod2, mod3, mod4, var='NotSex') {
+  
+  # If not sex-stratified or if the factor is the not sex, we will add sex to the models
+  if (whichSex != 0 || var == 'sex') {
+    datapred = mydata_long %>% drop_na(c("VAR", "Phenotype", "time"))
+  } else{
+    datapred = mydata_long %>% drop_na(c("VAR", "Phenotype", "time", "sex"))
+  }
+  
+  # smod1–smod4 indicate whether the corresponding model was fitted.
+  if (smod1)
+    datapred$p1 <- predict(mod1, newdata = datapred)
+  if (smod2)
+    datapred$p2 <- predict(mod2, newdata = datapred)
+  if (smod3)
+    datapred$p3 <- predict(mod3, newdata = datapred)
+  if (smod4)
+    datapred$p4 <- predict(mod4, newdata = datapred)
+  
+  # Calculate the observed mean phenotype at each visit
+  par(mfrow = c(1, 1))
+  
+  moy <- aggregate(Phenotype ~ VAR + time, data = mydata_long, mean, na.rm = T)
+  colnames(moy)[3] = 'Phenotype'
+  
+  # Plot the observed mean phenotype trajectory.
+  plot(
+    moy$time,
+    moy$Phenotype,
+    pch = 4,
+    xlab = 'Visit',
+    ylab = paste0(phenotype, ' z-score')
+  )
+  
+  # Connect the observed means across visits.
+  lines(moy$time, moy$Phenotype, lty = 3, col = 1)
+  
+  # Add predictions from each candidate model to the plot.
+  last = 1
+  # mod1
+  if (smod1) {
+    points(datapred$time, datapred$p1, col = 2)
+    lines(datapred$time, datapred$p1, lty = 3, col = 2)
+    last = 2
+  }
+  
+  # mod2
+  if (smod2) {
+    points(datapred$time, datapred$p2, col = 3)
+    lines(datapred$time, datapred$p2, lty = 3, col = 3)
+    last = 3
+  }
+  
+  # mod3
+  if (smod3) {
+    points(datapred$time, datapred$p3, col = 4)
+    lines(datapred$time, datapred$p3, lty = 3, col = 4)
+    last = 4
+  }
+  
+  # mod4
+  if (smod4) {
+    points(datapred$time, datapred$p4, col = 5)
+    lines(datapred$time, datapred$p4, lty = 3, col = 5)
+    last = 5
+  }
+  
+  # Add a legend identifying the observed mean and predictions from each candidate model.
+  legend(
+    'bottomright',
+    col = 1:last,
+    lty = 1,
+    legend = c("Mean", "Linear", "Quadratic", "VAR*Time", "VAR*Time2")[1:last]
+  )
+  return(datapred)
+}
+```
+
+## Helper function getColumn()
+This function extracts the selected environmental variable from the original dataset, formats it according to the available measurement visits, and merges it with the longitudinal outcome dataset.
+
+```{r}
+getColumn <- function(mydata_long, var, age) {
+
+  # Identify all columns corresponding to the environmental variable.
+  allEnv = colnames(df)[grep(var, colnames(df))] 
+  
+  # Select variables for child analyses.
+  if (age == 'Child') {
+    
+    # Remove maternal variables when the selected variable is not explicitly a maternal variable.
+    if (!grepl('Mom', var) & sum(grepl('Mom', allEnv) != 0)) {
+      allEnv = allEnv[-grep('Mom', allEnv)]
+    }
+    
+    # This will be specific to your dataset.
+    # Remove variables that do not correspond to the required measurement visits or should otherwise be excluded.
+    allEnv = allEnv[!(
+      allEnv %in% c(
+        'PredictedEnergyIntakeKCAL_3yrs',
+        'MPVAsedentary_F13',
+        'MPVAmvpa_F13',
+        'MVPAcpm_F13',
+        'T_Townsend_32weeksPREG',
+        'T_Townsend_F11',
+        'T_Townsend_8mtns',
+        'T_Townsend_F11',
+        'rbmi_Mom',
+        'impedance_F7',
+        'impedance_F9',
+        'impedance_F11'
+      )
+    )]
+    
+  } else{
+    # Select variables for maternal analyses.
+    allEnv = allEnv[grep('Mom', allEnv)]
+    df2 = df[, c('IID', allEnv)]
+  
+    # Rename to a clean name
+    colnames(df2)[2] = var
+    
+    # Merge directly (no reshaping needed)
+    mydata_long = merge(mydata_long, df2, by = "IID", all.x = TRUE)
+    
+    return(mydata_long)
+  }
+  
+  # Extract the IID and all environmental column
+  df2 = df[, c('IID', allEnv)]
+  
+  
+  # Standardise environmental variable names across visits.
+  # Environmental variables may have been measured at different visits. The following conditions rename the available measurements to the corresponding outcome visit and, where necessary, carry measurements forward to subsequent visits.
+  if (length(allEnv) > 1) {
+    
+    # Special case: frequency of sweet fruit juice consumption.
+    # F9 is used for the age-7 outcome and F11 is used for age 15, 18 and 24 outcomes.
+    if (var == 'FreqDrinkSweetFruitJuice') { 
+      
+      df2 = df2 %>% dplyr::rename(
+        "FreqDrinkSweetFruitJuice.7" = "FreqDrinkSweetFruitJuice_F9",
+        "FreqDrinkSweetFruitJuice.15" = "FreqDrinkSweetFruitJuice_F11"
+      )
+      df2$FreqDrinkSweetFruitJuice.18 = df2$FreqDrinkSweetFruitJuice.15
+      df2$FreqDrinkSweetFruitJuice.24 = df2$FreqDrinkSweetFruitJuice.15
+      
+    # Variables measured at F7 and F13. # F7 is used for the age-7 outcome and F13 is used for age 15,
+    # 18 and 24 outcomes.
+    } else if (length(allEnv) == 2 & sum(grepl('F7|F13', allEnv)) == 2) { 
+
+      colnames(df2)[colnames(df2) == paste0(var, "_F7")] = paste0(var, ".7")
+      colnames(df2)[colnames(df2) == paste0(var, "_F13")] = paste0(var, ".15")
+      df2[, paste0(var, ".18")] = df2[, paste0(var, ".15")]
+      df2[, paste0(var, ".24")] = df2[, paste0(var, ".15")]
+      
+    # Variables measured at F7 and F9.
+    # F7 is used for the age-7 outcome and F9 is used for age 15, 18 and 24 outcomes.
+    } else if (length(allEnv) == 2 & sum(grepl('F7|F9', allEnv)) == 2) { # Measured at F7 and F9
+ 
+      colnames(df2)[colnames(df2) == paste0(var, "_F7")] = paste0(var, ".7")
+      colnames(df2)[colnames(df2) == paste0(var, "_F9")] = paste0(var, ".15")
+      df2[, paste0(var, ".18")] = df2[, paste0(var, ".15")]
+      df2[, paste0(var, ".24")] = df2[, paste0(var, ".15")]
+      
+      
+    # Variables measured at F11 and F15.
+    # The F11 measurement is assigned to the baseline outcome visit and F15 is used for the later outcome visits.
+    } else if (length(allEnv) == 2 & sum(grepl('F11|F15', allEnv)) == 2) { # Measured at F11 and F15. Yeah I know, time consistency...
+
+      colnames(df2)[colnames(df2) == paste0(var, "_F11")] = paste0(var, ".0")
+      colnames(df2)[colnames(df2) == paste0(var, "_F15")] = paste0(var, ".15")
+      df2[, paste0(var, ".18")] = df2[, paste0(var, ".15")]
+      df2[, paste0(var, ".24")] = df2[, paste0(var, ".15")]
+    
+     # Variables measured at the same four outcome visits.  
+    } else if (length(allEnv) == 4 & sum(grepl('F7|F15|F18|F24', allEnv)) == 4) { 
+      colnames(df2)[colnames(df2) == paste0(var, "_F7")] = paste0(var, ".7")
+      colnames(df2)[colnames(df2) == paste0(var, "_F15")] = paste0(var, ".15")
+      colnames(df2)[colnames(df2) == paste0(var, "_F18")] = paste0(var, ".18")
+      colnames(df2)[colnames(df2) == paste0(var, "_F24")] = paste0(var, ".24")
+    
+    # Special case: household income quintile.
+    } else if (var == 'T_Income_Quintile') {
+      colnames(df2)[colnames(df2) == paste0(var, "_2000")] = paste0(var, ".7")
+      colnames(df2)[colnames(df2) == paste0(var, "_2004")] = paste0(var, ".15")
+      colnames(df2)[colnames(df2) == paste0(var, "_2007")] = paste0(var, ".18")
+      colnames(df2)[colnames(df2) == paste0(var, "_2010")] = paste0(var, ".24")
+    
+    # Variables measured at F13, F15 and F18.
+    # F13 is assigned to the age-7 outcome, F15 to age 15 and F18 is carried forward to the age-24 outcome.
+    } else if (length(allEnv) == 3 & sum(grepl('F13|F15|F18', allEnv)) == 3) { 
+      colnames(df2)[colnames(df2) == paste0(var, "_F13")] = paste0(var, ".0")
+      colnames(df2)[colnames(df2) == paste0(var, "_F15")] = paste0(var, ".15")
+      colnames(df2)[colnames(df2) == paste0(var, "_F18")] = paste0(var, ".18")
+      df2[, paste0(var, ".24")] = df2[, paste0(var, ".18")]
+    
+    # Variables measured at F7, F15 and F18.
+    # F7 is used for the age-7 outcome, F15 for age 15 and F18 is carried forward to the age-24 outcome.
+    } else if (length(allEnv) == 3 & sum(grepl('F7|F15|F18', allEnv)) == 3) {
+      colnames(df2)[colnames(df2) == paste0(var, "_F7")] = paste0(var, ".7")
+      colnames(df2)[colnames(df2) == paste0(var, "_F15")] = paste0(var, ".15")
+      colnames(df2)[colnames(df2) == paste0(var, "_F18")] = paste0(var, ".18")
+      df2[, paste0(var, ".24")] = df2[, paste0(var, ".18")]
+    }
+  } 
+  
+  # Special case: processed diet score.
+  if (var == 'ProcessedDietScore') {
+
+        colnames(df2)[colnames(df2) == paste0(var, "_F13")] = paste0(var, ".13")
+        df2[, paste0(var, ".15")] = df2[, paste0(var, ".13")]
+        df2[, paste0(var, ".18")] = df2[, paste0(var, ".15")]
+        df2[, paste0(var, ".24")] = df2[, paste0(var, ".15")]
+    }
+    
+  # Remove variables that do not correspond to the required outcome
+  # visits when measurements were available only at earlier visits.
+  if (any(grepl("\\.0$|\\.13$", colnames(df2)))){
+    df2 <- df2[, !grepl("(\\.0$|\\.13$|\\.7$|_.*7$)", colnames(df2))]
+  }
+    
+  # Standardise variable names.
+  df2 <- df2 %>% rename_with(~ sub("_F", ".", .x))
+  phenotype_cols <- grep(paste0("^", phenotype, "\\."), colnames(df2), value = TRUE)
+  new_names <- sub(paste0("^", phenotype), "Phenotype", phenotype_cols)
+  df2 <- df2 %>% rename_at(vars(all_of(phenotype_cols)), ~ new_names)
+
+  # Reformat the datatable: Instead of having one line by individual, each line will be one individual and one visit
+  mydata_long2 = reshape(
+    df2,
+    idvar = "IID",
+    sep = ".",
+    varying = colnames(df2)[grep('.', colnames(df2), fixed = TRUE)],
+    direction = "long"
+  )
+  
+  # Remove the time column, since it will be duplicated during the merge
+  mydata_long2 = mydata_long2[, !(colnames(mydata_long2) %in% c('time'))]
+  
+  # The rownames is the same : ID.Visit, so we merge by this
+  mydata_long = merge(mydata_long, mydata_long2, by = 0, sort = FALSE)
+  rownames(mydata_long) = mydata_long[, 1] 
+  mydata_long = mydata_long[, -1]
+  
+  # Since the IID column is present in both, I will remove the duplicated and rename (IID.x to IID)
+  mydata_long = mydata_long[, !(colnames(mydata_long) %in% c('IID.y'))]
+  colnames(mydata_long)[1] = 'IID'
+  
+  return(mydata_long)
+}
+```
+
+
+# _______________________________
+
+## LMM - Step 1 - Choose random-effects and correlation structure
+This function fits candidate linear mixed-effects models (LMMs) using the fixed-effects structure selected in Check 2. Four candidate LMM structures are evaluated, differing in their random-effects and within-individual correlation structures. The model with the lowest BIC is selected for subsequent analyses.
+
+```{r}
+step1_bestSlope <- function(mydata_long, best_model_linear, allResult_S, var='NotSex', adjust_maternal_age = TRUE) {
+  
+  if (best_model_linear == 'mod1') {
+    formula = "Phenotype ~ VAR + time + AgeDelivery_Mom + sex"
+    formula2 = "Phenotype ~ VAR * time + AgeDelivery_Mom + sex"
+  } else if (best_model_linear == 'mod2') {
+    formula = "Phenotype ~ VAR + time +I(time^2) + AgeDelivery_Mom + sex"
+    formula2 = "Phenotype ~ VAR * time +I(time^2) + AgeDelivery_Mom + sex"
+  } else if (best_model_linear == 'mod3') {
+    formula = "Phenotype ~ VAR*time +I(time^2) + AgeDelivery_Mom + sex"
+    formula2 = "Phenotype ~ VAR + time +I(time^2) + AgeDelivery_Mom + sex"
+  } else if (best_model_linear == 'mod4') {
+    mydata_long$timesq <- mydata_long$time^2
+    formula = "Phenotype ~ VAR*time + VAR*timesq + AgeDelivery_Mom + sex"
+    formula2 = "Phenotype ~ VAR*time + timesq + AgeDelivery_Mom + sex"
+  }
+  
+  # Add maternal age at delivery when requested.
+  if (adjust_maternal_age) {
+    formula = sub( "Phenotype ~", "Phenotype ~", formula)
+    formula = paste(formula, "+ AgeDelivery_Mom")
+    formula2 = paste(formula2, "+ AgeDelivery_Mom")
+  }
+
+  # Will remove the sex from the equation if sex-stratified or if the factor is sex
+  if(whichSex!=0 || var=='sex'){
+    formula=gsub(' + sex','',formula, fixed=TRUE)
+    formula2=gsub(' + sex','',formula2, fixed=TRUE)
+  }
+  
+  allResult_S$Formula_best_linear_model = formula
+
+  # m1: Random intercept only, corr structure Ar1
+  m1 <- lme(
+    as.formula(formula),
+    data = mydata_long,
+    random = ~ 1 | IID,
+    corr = corAR1(form = ~ 1 | IID),
+    method = 'ML',
+    na.action = na.omit
+  )
+  
+  outputm1 <- summary(m1)
+  
+  # m2: random intercept only, corr structure constant (compound symm)
+  m2 <- lme(
+    as.formula(formula),
+    data = mydata_long,
+    random = ~ 1 | IID,
+    corr = corCompSymm(form = ~ 1 | IID),
+    method = 'ML',
+    na.action = na.omit
+  )
+  
+  #m3: Random intercept and slopes, corr structure constant (compound symm)
+  m3 <- try(lme(
+    as.formula(formula),
+    data = mydata_long,
+    random = ~ time | IID,
+    cor = corCompSymm(form = ~ 1 | IID),
+    method = 'ML',
+    na.action = na.omit
+  ))
+  
+  if (sum(grepl('Error', m3))) {
+    m3 = NULL
+    
+  }
+  
+  #m4: Random intercept and slopes, corr structure constant (compound symm)
+  m4 <- try(lme(
+    as.formula(formula),
+    data = mydata_long,
+    random = ~ time | IID,
+    corr = corAR1(form = ~ 1 | IID),
+    method = 'ML',
+    na.action = na.omit
+  ))
+  
+  if (sum(grepl('Error', m4))) {
+    m4 = NULL
+    
+  }
+  
+  # compare BIC - keep the lowest
+  if (is.null(m3) & !is.null(m4)) {
+    al_mod = anova.lme(m1, m2, m4)
+  } else if (is.null(m4)) {
+    al_mod = anova.lme(m1, m2)
+  } else{
+    al_mod = anova.lme(m1, m2, m3, m4)
+  }
+  
+  best_al_mod = rownames(al_mod[which.min(al_mod$BIC), ])
+  
+  
+  bm1 = al_mod['m1', 'BIC']
+  bm2 = al_mod['m2', 'BIC']
+  bm3 = al_mod['m3', 'BIC']
+  bm4 = al_mod['m4', 'BIC']
+  
+  allResult_S$bic_m1 = bm1
+  allResult_S$bic_m2 = bm2
+  allResult_S$bic_m3 = bm3
+  allResult_S$bic_m4 = bm4
+  
+  allResult_S$best_lmm_model = best_al_mod
+  
+  if (best_al_mod == 'm1') {
+    rando = '~ 1|IID'
+    corfct = 'corAR1'
+    m = m1
+  } else if (best_al_mod == 'm2') {
+    rando = '~ 1|IID'
+    corfct = 'corCompSymm'
+    m = m2
+  } else if (best_al_mod == 'm3') {
+    rando = '~ time|IID'
+    corfct = 'corCompSymm'
+    m = m3
+  } else if (best_al_mod == 'm4') {
+    rando = '~ time|IID'
+    corfct = 'corAR1'
+    m = m4
+  }
+  allResult_S$Random=rando
+  allResult_S$correlation_function=corfct
+  
+  out=list(best_al_mod=best_al_mod, allResult_S=allResult_S, m=m, formula=formula, formula2=formula2)
+  return(out)
+}
+```
+
+## LMM - Step 2 - Fit final models and extract results
+This function fits the final LMMs using the best-fitting time trajectory, random-effects structure, and correlation structure identified in the previous steps. It fits models with and without the VAR*time interaction and extracts the estimated coefficients, standard errors, p-values, model formulas, and interaction terms for the final results table
+```{r}
+step2_interaction<-function(allResult,allResult_S,mydata_long, corfct,rando, formula, formula2, best_model_linear){
+  if (corfct == 'corAR1') {
+
+    # Two LMM are performed - One without time interaction and one with factor*time
+    m1_cont <-
+      lme(
+        as.formula(formula), # Formula without interaction (if mod1 or mod2), or with (if mod4)
+        data = mydata_long, # Dataframe
+        random = as.formula(rando), # Which random variable
+        corr = corAR1(form = ~ 1 | IID), # The correlation parameters
+        method = 'ML', # Methods
+        na.action = na.omit # Remove NA
+      )
+    
+    m1_int <-
+      lme(
+        as.formula(formula2), # Formula with interaction (if mod1 or mod2), or without (if mod4)
+        data = mydata_long, 
+        random = as.formula(rando),
+        corr = corAR1(form = ~ 1 | IID),
+        method = 'ML',
+        na.action = na.omit
+      )
+    
+    
+  } else if (corfct == 'corCompSymm') {
+    m1_cont <-
+      lme(
+        as.formula(formula),
+        data = mydata_long,
+        random = as.formula(rando),
+        corr = corCompSymm(form = ~ 1 | IID),
+        method = 'ML',
+        na.action = na.omit
+      )
+    
+    m1_int <-
+      lme(
+        as.formula(formula2),
+        data = mydata_long,
+        random = as.formula(rando),
+        corr = corCompSymm(form = ~ 1 | IID),
+        method = 'ML',
+        na.action = na.omit
+      )
+  }
+  
+  #summarize an lme object (gets beta hat, se, t-value, p-value for fixed effects)
+  outputm1 <- summary(m1_cont)
+  tabl = outputm1$tTable
+  tabl
+  
+  #summarize an lme object (gets beta hat, se, t-value, p-value for fixed effects)
+  outputm1 <- summary(m1_int)
+  tabl_int = outputm1$tTable
+  tabl_int
+  
+  
+  # Extract results from the LMM table, depending on the best fitting models. 
+  if (best_model_linear %in% c('mod1', 'mod2')) {
+    allResult_S$formula_cont = formula # Will keep the formula of the model WITHOUT interaction
+    
+    # Get the BMI association results WITHOUT interaction
+    allResult_S$VAR_cont_b = tabl['VAR', 'Value'] 
+    allResult_S$VAR_cont_se = tabl['VAR', 'Std.Error']
+    allResult_S$VAR_cont_p = tabl['VAR', 'p-value']
+  
+    ##########
+    # Get results from interaction
+    allResult_S$formula_int = formula2
+    
+    # Get the BMI association results WITHOUT interaction, from the models WITH time-interaction
+    allResult_S$VAR_int_b = tabl_int['VAR', 'Value']
+    allResult_S$VAR_int_se = tabl_int['VAR', 'Std.Error']
+    allResult_S$VAR_int_p = tabl_int['VAR', 'p-value']
+    
+    # Get the BMI*time association from the models WITH time-interaction
+    allResult_S$VARtime_int_b = tabl_int['VAR:time', 'Value']
+    allResult_S$VARtime_int_se = tabl_int['VAR:time', 'Std.Error']
+    allResult_S$VARtime_int_p = tabl_int['VAR:time', 'p-value']
+    
+    # Not applicable for this models, but need the column
+    allResult_S$VARtime2_int_b = NA
+    allResult_S$VARtime2_int_se = NA
+    allResult_S$VARtime2_int_p = NA
+    
+  } else if (best_model_linear %in% c('mod3')) { # Never tested, but really similar to above, but we switch formula and formula2 since the interaction is present in formula, but not formula2
+    allResult_S$formula_cont = formula2
+    
+    # Get BMI results without time-interaction
+    allResult_S$VAR_cont_b = tabl_int['VAR', 'Value']
+    allResult_S$VAR_cont_se = tabl_int['VAR', 'Std.Error']
+    allResult_S$VAR_cont_p = tabl_int['VAR', 'p-value']
+    
+    #################
+    # Formula with BMI*time interaction
+    allResult_S$formula_int = formula
+    
+    # Get BMI results WITHOUT interaction from model WITH time interaction
+    allResult_S$VAR_int_b = tabl['VAR', 'Value']
+    allResult_S$VAR_int_se = tabl['VAR', 'Std.Error']
+    allResult_S$VAR_int_p = tabl['VAR', 'p-value']
+    
+    # Extract BMI*time results
+    allResult_S$VARtime_int_b = tabl['VAR:time', 'Value']
+    allResult_S$VARtime_int_se = tabl['VAR:time', 'Std.Error']
+    allResult_S$VARtime_int_p = tabl['VAR:time', 'p-value']
+    
+    # Not applicable for this models
+    allResult_S$VARtime2_int_b = NA
+    allResult_S$VARtime2_int_se = NA
+    allResult_S$VARtime2_int_p = NA
+    
+  } else if (best_model_linear %in% c('mod4')) { # The more complex model
+    
+    # Will extract the BMI result from the simplest formula of the two models
+    allResult_S$formula_cont = formula2
+    allResult_S$VAR_cont_b = tabl_int['VAR', 'Value']
+    allResult_S$VAR_cont_se = tabl_int['VAR', 'Std.Error']
+    allResult_S$VAR_cont_p = tabl_int['VAR', 'p-value']
+    
+    #############
+    # Complex models
+    allResult_S$formula_int = formula
+    
+    # BMI WITHOUT interaction from the model WITH interaction
+    allResult_S$VAR_int_b = tabl['VAR', 'Value']
+    allResult_S$VAR_int_se = tabl['VAR', 'Std.Error']
+    allResult_S$VAR_int_p = tabl['VAR', 'p-value']
+    
+    # BMI*time itneraction form the model WITH interaction
+    allResult_S$VARtime_int_b = tabl['VAR:time', 'Value']
+    allResult_S$VARtime_int_se = tabl['VAR:time', 'Std.Error']
+    allResult_S$VARtime_int_p = tabl['VAR:time', 'p-value']
+    
+    # BMI*time2 interaction
+    allResult_S$VARtime2_int_b = tabl['VAR:timesq', 'Value']
+    allResult_S$VARtime2_int_se = tabl['VAR:timesq', 'Std.Error']
+    allResult_S$VARtime2_int_p = tabl['VAR:timesq', 'p-value']
+  }
+  
+  # combine
+  allResult = rbind(allResult, allResult_S)
+  
+  return(allResult)
+}
+```
+
+# _______________________________
+# Main Script 
+## Data preprocessing 
+
+```{r}
+df=readRDS('processed_pheno.rds')
+
+# Keep only the child
+df$IID <- df$IID_child
+df=df[grep('A',df$IID),]
+
+# Continuous outcomes 
+t2dVariable=c('zfglucose','zfinsulin','zhomair') 
+
+# My exposure name 
+columnBMI = 'prepreg_bmi'
+
+# Creating phenotype (outcome) and exposure dataframe
+all_pheno_bmi = data.frame(
+  Factor = rep(columnBMI, 3),
+  Phenotype = c('zfglucose', 'zfinsulin', 'zhomair')
+)
+
+# Creating data frame with phenotype (outcome) and child covariates of interest  
+Env_Child <- data.frame(
+  Factor = c('FreqDrinkSweetFruitJuice','HealthAwareScore', 'ProcessedDietScore', 'MPVAmvpa', 'MPVAsedentary', 'impedance', 'T_Income_Quintile', 'T_Townsend'),
+  Phenotype = c(rep('zfglucose', 8), rep('zfinsulin', 8), rep('zhomair', 8))
+)
+
+# Creating data frame with phenotype (outcome) and mother covariates of interest  
+Env_Mom <- data.frame(
+  Factor = c('ConfectionaryDietScore_32weeksPREG_Mom','ProcessedDietScore_32weeksPREG_Mom','VegetarianDietScore_32weeksPREG_Mom','PhysicalActivity_PREG_Mom', 'TobaccoSmokedREG_EndPREG_Mom', 'TobaccoSmokedREG_1to3mtnsPREG_Mom', 'TobaccoSmokedREG_PrePREG_Mom'),
+  Phenotype = c(rep('zfglucose', 7), rep('zfinsulin', 7), rep('zhomair', 7))
+)
+
+```
+
+## LMM: Base covariates 
+This section runs the complete LMM analysis for each exposure–outcome pair and separately for the combined-sex, male, and female analyses. It includes only base covariates (sex of the child and the mother's age at delivery)
+
+```{r}
+whichSex=0 #0 = mixte, 1 = male, 2 = female
+
+for(whichSex in 0:2){
+
+  nameSex = c('Mixte', 'Male', 'Female') # 0 = combines, Male = 1, Female = 2; 
+  
+  whichResultName = paste0('/LMM_results/LMM.Base.', nameSex[whichSex + 1], '.rds') # Name for the results outcome file
+  
+  allResult = NULL # Contains all other results
+  
+  for (j in 1:nrow(all_pheno_bmi)) { 
+    
+    var = all_pheno_bmi[j, 1] # Will get the exposure (BMI)
+    phenotype = all_pheno_bmi[j, 2] # Will get the outcome
+    
+    # Result writing
+    allResult_S = t(as.data.frame(c(var, phenotype)))
+    colnames(allResult_S) = c('VAR', 'Phenotype') 
+    allResult_S = as.data.frame(allResult_S)
+    
+    # Extract the information in a dataframe
+    df2 = df[, c(
+      'IID',
+      var,
+      paste0('age_yrs_', c('F7', 'F15', 'F18', 'F24')),
+      paste0(phenotype, '_', c('F7', 'F15', 'F18', 'F24')),
+      'sex',
+      'AgeDelivery_Mom'
+    )]
+    
+   # Rename the column
+    df2 = df2 %>% dplyr::rename(
+      "age_yrs.7" = "age_yrs_F7",
+      "age_yrs.15" = "age_yrs_F15",
+      "age_yrs.18" = "age_yrs_F18",
+      "age_yrs.24" = "age_yrs_F24",
+      "Phenotype.7" = paste0(phenotype, "_F7"), 
+      "Phenotype.15" = paste0(phenotype, "_F15"),
+      "Phenotype.18" = paste0(phenotype, "_F18"),
+      "Phenotype.24" = paste0(phenotype, "_F24")
+    )
+    
+    colnames(df2)[colnames(df2) == var] = 'VAR' 
+
+    # Reshape so the all visits will be in the same column
+    mydata_long = reshape(
+      df2, # This df contain only column of interest
+      idvar = "IID", # ID
+      sep = ".", # Which separator between the name and visit
+      varying = colnames(df2)[grep('.', colnames(df2), fixed = TRUE)], 
+      direction = "long" # direction that you want to extent
+    )
+    mydata_long = mydata_long[!is.na(mydata_long$Phenotype), ] # Remove NA
+    
+    # Scale and remove outlier from the outcome (Phenotype)
+    mydata_long = scaleTheVariableAndRemoveOutlier(mydata_long, 'Phenotype') 
+    
+    # If sex-stratified, only keep one sex and remove column sex
+    if (whichSex != 0) {
+      mydata_long = mydata_long[mydata_long$sex == whichSex, ] # Extract only male or female
+      mydata_long = mydata_long[, !(colnames(mydata_long) %in% 'sex')] # Remove the column sex
+    }
+    
+    # Get sample size
+    id = length(unique(colsplit(rownames(na.omit(mydata_long)) , '\\.', c('A', 'B'))$A)) # Count the number of unique individual
+    allResult_S$N_id = paste0(nrow(na.omit(mydata_long)), ' (', id, ')') # Count the number of observation
+    
+    
+    
+    #################################################################
+    # First Checking step - Should be constant since the outcome is normalized by visit
+    check1_MeanAcrossTime(mydata_long, phenotype)
+
+    
+    #################################################################
+    # Get the best linear model (time, time^2, VAR*time, VAR*time^2)
+    out = check2_BestLinearModel(mydata_long, allResult_S)
+    
+    allResult_S = out$allResult_S
+    best_model_linear = allResult_S$best_linear_model
+    smod1 = out$smod1
+    smod2 = out$smod2
+    smod3 = out$smod3
+    smod4 = out$smod4
+    
+    mod1 = out$mod1
+    mod2 = out$mod2
+    mod3 = out$mod3
+    mod4 = out$mod4
+    
+    
+    # Boxplot - does the scale seems constant across time?
+    # Check step - box plot - does the scale seems constant across time?
+    boxplot(mydata_long$Phenotype ~ mydata_long$time, ylim = c(-3, 3))
+    
+    
+    
+    #################################################################
+    # Let's look at predictions 
+    datapred = check3_Prediction(mydata_long, smod1, smod2, smod3, smod4, mod1, mod2, mod3, mod4)
+    
+    
+    # LMM
+    # Chose best slope model
+    out = step1_bestSlope(mydata_long, best_model_linear, allResult_S)
+    
+    # Keep all informations in a table
+    best_al_mod = out$best_al_mod
+    allResult_S = out$allResult_S
+    formula = out$formula
+    formula2 = out$formula2
+    m = out$m
+    
+    datapred = out$datapred
+    rando = allResult_S$Random
+    corfct = allResult_S$correlation_function
+    
+    
+    
+    #################################################################
+    #### Residual
+    # Check Step - Residual - Is it uniforms across x-axis? 
+    dim(datapred)
+    datapred$residuals = residuals(m)
+    plot(datapred$residuals)
+    
+    
+    #################################################################
+    allResult = step2_interaction(
+      allResult,
+      allResult_S,
+      mydata_long,
+      corfct,
+      rando,
+      formula,
+      formula2,
+      best_model_linear
+    )
+    allResult = unique(allResult)
+  
+    
+  }
+  
+  saveRDS(allResult, whichResultName)
+}
+```
+
+## LMM: Env variables - child 
+
+This section runs the complete LMM analysis for each child covariate–outcome pair and separately for the combined-sex, male, and female analyses.
+
+```{r}
+
+nameSex = c('Mixte', 'Male', 'Female')
+
+for(whichSex in 0:2){ #0 = mixte, 1=male, 2=female
+  # Name of the result file
+  whichResultName = paste0('/LMM_results/LMM.Env.child.', nameSex[whichSex + 1], '.rds')
+  
+  allResult = NULL
+  
+  for (j in 1:nrow(Env_Child)) { # Will only perform LMM for combination significant in at least one visit
+    var = Env_Child[j, 1] # Extract factor
+    phenotype = Env_Child[j, 2] # Extract outcome
+    
+    if (var == 'sex' && whichSex != 0) { 
+      next
+    }
+    
+    # Result writing
+    allResult_S = t(as.data.frame(c(var, phenotype)))
+    colnames(allResult_S) = c('VAR', 'Phenotype')
+    allResult_S = as.data.frame(allResult_S)
+    
+    # Prepare ID, age, and phenotype variables
+    df2 = df[, c(
+      'IID',
+      paste0('age_yrs_', c('F7', 'F15', 'F18', 'F24')),
+      paste0(phenotype, '_', c('F7', 'F15', 'F18', 'F24')),
+      'sex'
+    )]
+    
+    df2 = df2 %>% rename_with(~ sub("_F", ".", .x))
+
+    phenotype_cols <- grep(
+      paste0("^", phenotype, "\\."),
+      colnames(df2),
+      value = TRUE
+    )
+    
+    new_names <- sub(
+      paste0("^", phenotype),
+      "Phenotype",
+      phenotype_cols
+    )
+    
+    df2 = df2 %>% rename_at(vars(all_of(phenotype_cols)), ~ new_names)
+        
+    # Reshape to long format
+    mydata_long = reshape(
+      df2,
+      idvar = "IID",
+      sep = ".",
+      varying = colnames(df2)[grep('.', colnames(df2), fixed = TRUE)],
+      direction = "long"
+    )
+    
+    mydata_long = mydata_long[!is.na(mydata_long$Phenotype), ]
+  
+    # Add the child environmental variable
+    mydata_long = getColumn(mydata_long, var, age = "Child")
+      
+    if (var == 'sex') {
+      mydata_long = scaleTheVariableAndRemoveOutlier(mydata_long, 'Phenotype', FALSE) 
+    } else{
+      mydata_long = scaleTheVariableAndRemoveOutlier(mydata_long, 'Phenotype')
+    }
+    
+    # Change the name of the factor for VAR, easier later
+    colnames(mydata_long)[grep(var, colnames(mydata_long))] = 'VAR'
+    mydata_long = mydata_long[!is.na(mydata_long$VAR), ]
+    
+    mydata_long$timesq <- mydata_long$time^2 # For a specific model
+    
+      
+    if (whichSex != 0) { # Sex-stratified analysis
+      mydata_long = mydata_long[mydata_long$sex == whichSex, ]
+      mydata_long = mydata_long[, !(colnames(mydata_long) %in% 'sex')]
+    }
+    
+    id = length(unique(colsplit(rownames(na.omit(mydata_long)), '\\.', c('A', 'B'))$A))
+    
+    allResult_S$N_id = paste0(nrow(na.omit(mydata_long)), ' (', id, ')')
+    
+    
+    #################################################################
+    # Cheking steps
+    check1_MeanAcrossTime(mydata_long, phenotype)
+    
+    
+    #################################################################
+    # Then check predictions from linear model, sex 
+    
+    out = check2_BestLinearModel(mydata_long, allResult_S, var, adjust_maternal_age=FALSE) 
+    
+    allResult_S = out$allResult_S
+    best_model_linear = allResult_S$best_linear_model
+    smod1 = out$smod1
+    smod2 = out$smod2
+    smod3 = out$smod3
+    smod4 = out$smod4
+    
+    mod1 = out$mod1
+    mod2 = out$mod2
+    mod3 = out$mod3
+    mod4 = out$mod4
+    
+    
+    #### Boxplot - does the scale seems constant across time?
+    boxplot(mydata_long$Phenotype ~ mydata_long$time, ylim = c(-3, 3))
+    
+    
+    
+    
+    
+    #################################################################
+    # Let's look at predictions 
+    datapred = check3_Prediction(mydata_long,  smod1, smod2, smod3, smod4, mod1, mod2, mod3, mod4, var)
+    
+    
+  
+    
+   
+    
+    #################################################################
+    # LMM
+    # Chose best slope model
+    out = step1_bestSlope(mydata_long, best_model_linear, allResult_S, var, adjust_maternal_age = FALSE)
+    best_al_mod = out$best_al_mod
+    allResult_S = out$allResult_S
+    formula = out$formula
+    formula2 = out$formula2
+    m = out$m
+    
+    datapred = out$datapred
+    rando = allResult_S$Random
+    corfct = allResult_S$correlation_function
+    
+    
+    
+    #################################################################
+    #### Residual
+    dim(datapred)
+    datapred$residuals = residuals(m)
+    
+    plot(datapred$residuals)
+    
+    
+    #################################################################
+    # Interaction
+    allResult = step2_interaction(
+      allResult,
+      allResult_S,
+      mydata_long,
+      corfct,
+      rando,
+      formula,
+      formula2,
+      best_model_linear
+    )
+    allResult = unique(allResult)
+    
+  }
+
+saveRDS(allResult, whichResultName)
+
+dev.off()
+
+}
+```
+
+
+## LMM: Env variables - mom
+
+This section runs the complete LMM analysis for each mother covariate–outcome pair and separately for the combined-sex, male, and female analyses.
+
+```{r}
+
+nameSex = c('Mixte', 'Male', 'Female')
+
+for(whichSex in 0:2){#0 = mixte, 1=male, 2=female
+  whichResultName = paste0('/LMM_results/LMM.Env.mom.', nameSex[whichSex + 1], '.rds') # Name for the results outcome file
+  
+  allResult = NULL
+  
+  for (j in 1:nrow(Env_Mom)) {
+    # Will only perform LMM for combination significant in at least one visit
+    var = Env_Mom[j, 1]
+    phenotype = Env_Mom[j, 2]
+    
+    
+    # Result writing
+    allResult_S = t(as.data.frame(c(var, phenotype)))
+    colnames(allResult_S) = c('VAR', 'Phenotype')
+    allResult_S = as.data.frame(allResult_S)
+    
+    
+    allEnv = colnames(df)[grep(var, colnames(df))]
+    allEnv = allEnv[grep('Mom', allEnv)] # ensure that it is only maternal variable
+    allEnv = allEnv[!(allEnv %in% c('rbmi_Mom'))]
+    
+    
+    df2 = df[, c(
+      'IID',
+      allEnv,
+      paste0('age_yrs_', c('F7', 'F15', 'F18', 'F24')),
+      paste0(phenotype, '_', c('F7', 'F15', 'F18', 'F24')),
+      'sex',
+      'AgeDelivery_Mom'
+    )]
+    
+    
+    df2 = df2 %>% dplyr::rename(
+      "age_yrs.7" = "age_yrs_F7",
+      "age_yrs.15" = "age_yrs_F15",
+      "age_yrs.18" = "age_yrs_F18",
+      "age_yrs.24" = "age_yrs_F24",
+      "Phenotype.7" = paste0(phenotype, "_F7"),
+      "Phenotype.15" = paste0(phenotype, "_F15"),
+      "Phenotype.18" = paste0(phenotype, "_F18"),
+      "Phenotype.24" = paste0(phenotype, "_F24")
+    )
+    
+    mydata_long = reshape(
+      df2,
+      idvar = "IID",
+      sep = ".",
+      varying = colnames(df2)[grep('.', colnames(df2), fixed = TRUE)],
+      direction = "long"
+    )
+    mydata_long = mydata_long[!is.na(mydata_long$Phenotype), ]
+    
+    
+    mydata_long = scaleTheVariableAndRemoveOutlier(mydata_long, 'Phenotype')
+    
+    colnames(mydata_long)[grep(var, colnames(mydata_long))] = 'VAR'
+    mydata_long = mydata_long[!is.na(mydata_long$VAR), ]
+    
+    mydata_long$timesq <- mydata_long$time^2
+    
+    
+    if (whichSex != 0) {
+      mydata_long = mydata_long[mydata_long$sex == whichSex, ]
+      mydata_long = mydata_long[, !(colnames(mydata_long) %in% 'sex')]
+    }
+    
+    id = length(unique(colsplit(
+      na.omit(mydata_long)$IID, '\\.', c('A', 'B')
+    )$A))
+    
+    allResult_S$N_id = paste0(nrow(na.omit(mydata_long)), ' (', id, ')')
+    
+    
+    
+    #################################################################
+    # Check 1
+    check1_MeanAcrossTime(mydata_long, phenotype)
+    
+    
+    ################################################################
+    # Check 2
+    out = check2_BestLinearModel(mydata_long, allResult_S, var)
+    
+    allResult_S = out$allResult_S
+    best_model_linear = allResult_S$best_linear_model
+    smod1 = out$smod1
+    smod2 = out$smod2
+    smod3 = out$smod3
+    smod4 = out$smod4
+    
+    mod1 = out$mod1
+    mod2 = out$mod2
+    mod3 = out$mod3
+    mod4 = out$mod4
+    
+    
+    #### Boxplot - does the scale seems constant across time?
+    boxplot(mydata_long$Phenotype ~ mydata_long$time, ylim = c(-3, 3))
+    
+    
+    
+    
+    
+    #################################################################
+    # Let's look at predictions 
+    datapred = check3_Prediction(mydata_long,
+                                 smod1,
+                                 smod2,
+                                 smod3,
+                                 smod4,
+                                 mod1,
+                                 mod2,
+                                 mod3,
+                                 mod4,
+                                 var)
+    
+    
+    
+    
+    #LMM 
+    
+    #################################################################
+    ### Chose best slope model
+    out = step1_bestSlope(mydata_long, best_model_linear, allResult_S, var)
+    best_al_mod = out$best_al_mod
+    allResult_S = out$allResult_S
+    formula = out$formula
+    formula2 = out$formula2
+    m = out$m
+    
+    datapred = out$datapred
+    rando = allResult_S$Random
+    corfct = allResult_S$correlation_function
+    
+    
+    
+    #################################################################
+    #### Residual
+    dim(datapred)
+    datapred$residuals = residuals(m)
+    
+    plot(datapred$residuals)
+    
+    
+    #################################################################
+    allResult = step2_interaction(
+      allResult,
+      allResult_S,
+      mydata_long,
+      corfct,
+      rando,
+      formula,
+      formula2,
+      best_model_linear
+    )
+    allResult = unique(allResult)
+    
+  }
+  
+  saveRDS(allResult, whichResultName)
+  
+  dev.off()
+}
+```
+
+## LMM: Base + Env variables  
+
+This will test all mom and child environmental variables that were significant (from previous analysis) and combine them together 
+
+```{r}
+for(whichSex in 0:2){
+
+  ## For the naming be automatic
+  nameSex = c('Mixte', 'Male', 'Female')
+  
+  allResult_Final = c()
+  
+  withBMIcie = TRUE # Do we want BMI, impedance and fat percent in the multivariable?
+  
+  if (withBMIcie) {
+    addOn = '.WithBMIcie'
+  } else{
+    addOn = ''
+  }
+  
+  ## Significant threshold used
+  seuilP = 0.05 / 9
+  
+  ## Fetch the results from the previous functions
+  ### Results from the BMI (base covariates analysis)
+  whichResultName = paste0('/LMM_results/LMM.Base.', nameSex[whichSex + 1], '.rds')
+  resultVAR = readRDS(whichResultName)
+
+    ### Results from the Environmental - child
+  whichResultName = paste0('/LMM_results/LMM.Env.child.', nameSex[whichSex + 1], '.rds')
+  resultEnv = readRDS(whichResultName)
+  resultEnv$Age = 'Child'
+  
+  ### Results from the Environmental - Mom
+  whichResultName = paste0('/LMM_results/LMM.Env.mom.', nameSex[whichSex + 1], '.rds')
+  resultEnvMom = readRDS(whichResultName)
+  resultEnvMom$Age = 'Mom'
+  
+  resultEnv = rbind(resultEnv, resultEnvMom)
+  
+  ## Generate the environmental df for each outcome
+  for (d in t2dVariable) {
+    # Extract results for this specific disease
+    resultVAR_t = resultVAR[resultVAR$Phenotype == d, ]
+    resultEnv_t = resultEnv[resultEnv$Phenotype == d, ]
+    
+    
+    # WARNING! I only had those two models (1 and 4) showing the best-fitting.
+    # Since I had many p-value in the result table, I ensure that the threshold filtering is on the right one
+    # For mod1 and mod2, it is the VAR/factor without interaction (cont)
+    # For mod3 and mod4, it is the VAR/factor with interaction (int)
+    resultEnv_t = resultEnv_t[(resultEnv_t$best_linear_model %in% c('mod1','mod2') & resultEnv_t$VAR_cont_p < seuilP) |
+                                (resultEnv_t$best_linear_model %in% c('mod3','mod4') & resultEnv_t$VAR_int_p < seuilP), ]
+    
+    
+    # Keep information
+    resultEnv_t_filt = resultEnv_t[, c('VAR', 'Age', 'best_linear_model')]
+    
+    if (withBMIcie) {
+      resultEnv_t_filt = resultEnv_t_filt[resultEnv_t_filt$VAR != 'sex', ] # We will add the sex anyway, so we remove it from the one to add
+    } else{
+      resultEnv_t_filt = resultEnv_t_filt[!grepl('Fat|bmi|imped', resultEnv_t_filt$VAR) & resultEnv_t_filt$VAR != 'sex', ] # Remove the sex (we add it anyway) and remove variable associated to BMI
+    }
+    
+    # Keep information
+    resultVAR_t_filt = resultVAR_t[, c('VAR', 'best_linear_model')]
+    
+    # Extract column for only basic variable/covariables
+    df2 = df[, c('IID',
+                 paste0('age_yrs_', c('F7', 'F15', 'F18', 'F24')),
+                 paste0(d, '_', c('F7', 'F15', 'F18', 'F24')),
+                 'sex',
+                 'AgeDelivery_Mom')]
+    
+    # Rename the covaraite/outcome
+    df2 = df2 %>% dplyr::rename(
+      "age_yrs.7" = "age_yrs_F7",
+      "age_yrs.15" = "age_yrs_F15",
+      "age_yrs.18" = "age_yrs_F18",
+      "age_yrs.24" = "age_yrs_F24",
+      "Phenotype.7" = paste0(d, "_F7"),
+      "Phenotype.15" = paste0(d, "_F15"),
+      "Phenotype.18" = paste0(d, "_F18"),
+      "Phenotype.24" = paste0(d, "_F24")
+    )
+    
+    #Formatting covariate/outcome
+    mydata_long = reshape(
+      df2,
+      idvar = "IID",
+      sep = ".",
+      varying = colnames(df2)[grep('.', colnames(df2), fixed = TRUE)],
+      direction = "long"
+    )
+    mydata_long = mydata_long[!is.na(mydata_long$Phenotype), ] # Remove outcome
+
+    #Remove outlier and scale
+    mydata_long = scaleTheVariableAndRemoveOutlier(mydata_long, 'Phenotype')
+    mydata_long$timesq <- mydata_long$time^2
+   
+    if (nrow(resultEnv_t_filt) != 0) { # Will add the environmental factors to the table with covariate/outcome. Those will be the same for all VAR
+      for (f_p in 1:nrow(resultEnv_t_filt)) {
+        mydata_long = getColumn(mydata_long, resultEnv_t_filt[f_p, 'VAR'], resultEnv_t_filt[f_p, 'Age'])
+        mydata_long=scaleTheVariableAndRemoveOutlier(mydata_long,resultEnv_t_filt[f_p, 'VAR'])
+      }
+
+      colNames = colnames(mydata_long)
+
+      # We will remove collinearity. We only want to check for non basic covariate, so we remove them before performing the VIF
+      colNames = colNames[!(
+        colNames %in% c(
+          'IID',
+          'Phenotype',
+          'age_yrs',
+          'sex',
+          'AgeDelivery_Mom',
+          'time',
+          'timesq'
+        )
+      )]
+      colNames_F = paste(colNames, collapse = ' + ') # Generate the formula containing all environmental factors
+      colNames_F = paste0('Phenotype ~ ', colNames_F) # Add the outcome to the formula
+      # Will only perform them for the most simplest model for the collinearity test (anyway, for me, the only variable showing non-linear was bmi/impedance/fat%, which were removed)
+      m <- lme(
+        as.formula(colNames_F),
+        data = mydata_long,
+        random = ~ 1 | IID,
+        corr = corAR1(form = ~ 1 | IID),
+        method = 'ML',
+        na.action = na.omit
+      )
+      vif_result = check_collinearity(m)
+      vif_result5 = vif_result[vif_result$VIF >= 5, "Term"]
+      colNames = colNames[!(colNames %in% vif_result5)]
+    }
+    
+    # Prepare for LMM with VAR + Env
+    ## Generate the environmental formula
+    formu = c('Phenotype ~ time + AgeDelivery_Mom')
+    if (whichSex == 0) {
+      formu = paste0(formu, ' + sex')
+    }
+    
+    # Among all the environmental factor, do we have some which does not have a time-linear. I only have mod1 and mod4, so you need to adjust in other case
+    if (nrow(resultEnv_t_filt) != 0) {
+      for (cN in colNames) {
+        best_model = resultEnv_t_filt[resultEnv_t_filt$VAR == cN, 'best_linear_model'] # Get which best model for the factor
+        if (best_model == 'mod1') {
+          formu = paste0(formu, ' + ', cN) # If it is mod1, only add the factor to the formula
+        } else if (best_model == 'mod4') {
+          formu = paste0(formu, ' + ', cN, '*time +', cN, '*timesq') # If the complex is the best, add interaction with time and time2
+        }
+      }
+    }
+    
+    if(whichSex!=0){ # If sex-stratified
+      mydata_long=mydata_long[mydata_long$sex==whichSex,]
+      mydata_long=mydata_long[,!(colnames(mydata_long)=='sex')]
+    }
+
+    
+    
+    for (nVAR in resultVAR_t_filt$VAR) { # For each VAR
+      # Faire un modèle ~1|IID et un modèle ~time|IID, prendre celui avec le plus bas BIC
+      best_model_VAR = resultVAR_t_filt[resultVAR_t_filt$VAR == nVAR, 'best_linear_model']
+      
+      formu_temp = formu # Copy since the VAR term can change
+      # Among all the environmental factor, do we have some which does not have a time-linear. I only have mod1 and mod4, so you need to adjust in other case
+      if (best_model_VAR == 'mod1') {
+        formu_temp = gsub('~','~ VAR +',formu_temp)
+      } else if (best_model_VAR == 'mod4') {
+        formu_temp = gsub('~','~ VAR*time +VAR*timesq +',formu_temp)
+      } 
+      
+      mydata_long_temp = mydata_long
+      df_VAR = df[, c('IID', nVAR)] # Add the VAR to the table
+      colnames(df_VAR)[2] = 'VAR'
+      mydata_long_temp = merge(mydata_long, df_VAR, by = 'IID')
+      mydata_long_temp = na.omit(mydata_long_temp)
+      
+      m_1IID <- lme(
+        as.formula(formu_temp),
+        data = mydata_long_temp,
+        random = ~ 1 | IID,
+        corr = corAR1(form = ~ 1 | IID), # This corr was always the best for all m ymodels
+        method = 'ML',
+        na.action = na.omit
+      )
+      
+      m_1timeIID <- try(lme( 
+        as.formula(formu_temp),
+        data = mydata_long_temp,
+        random = ~ time | IID,
+        corr = corAR1(form = ~ 1 | IID),
+        method = 'ML',
+        na.action = na.omit
+      ))
+      
+      
+      min_Random = 'm_1IID'
+      if (sum(grepl('Error', m_1timeIID)) == 0) {
+        bic_final = BIC(m_1IID, m_1timeIID) # Extract the best between both random effect variable
+        min_Random = rownames(bic_final[which.min(bic_final$BIC), ])
+      }
+      
+      if (min_Random == 'm_1IID') {
+        best_total = m_1IID
+        rand = '~1 | IID'
+      } else{
+        best_total = m_1timeIID
+        rand = '~time | IID'
+      }
+      
+      #summarize an lme object (gets beta hat, se, t-value, p-value for fixed effects)
+      outputm1 <- summary(best_total)
+      tabl = outputm1$tTable
+      
+      # Extract result depending on the best models, again, only mod1 and mod4 in my case
+      b = round(tabl['VAR', 'Value'], digits = 6)
+      se = round(tabl['VAR', 'Std.Error'], digits = 6)
+      p = formatC(tabl['VAR', 'p-value'], format = "e", digits = 2)
+      
+      if (best_model_VAR == 'mod1') {
+        b_t = NA
+        se_t = NA
+        p_t = NA
+        
+        b_t2 = NA
+        se_t2 = NA
+        p_t2 = NA
+      } else if (best_model_VAR == 'mod4') {
+        if (sum(rownames(tabl) == 'time:VAR') == 1) {
+          b_t = round(tabl['time:VAR', 'Value'], digits = 6)
+          se_t = round(tabl['time:VAR', 'Std.Error'], digits = 6)
+          p_t = formatC(tabl['time:VAR', 'p-value'], format = "e", digits = 6)
+        } else{
+          b_t = round(tabl['VAR:time', 'Value'], digits = 6)
+          se_t = round(tabl['VAR:time', 'Std.Error'], digits = 6)
+          p_t = formatC(tabl['VAR:time', 'p-value'], format = "e", digits = 6)
+        }
+        
+        if (sum(rownames(tabl) == 'timesq:VAR') == 1) {
+          b_t2 = round(tabl['timesq:VAR', 'Value'], digits = 6)
+          se_t2 = round(tabl['timesq:VAR', 'Std.Error'], digits = 6)
+          p_t2 = formatC(tabl['timesq:VAR', 'p-value'], format = "e", digits = 6)
+        } else{
+          b_t2 = round(tabl['VAR:timesq', 'Value'], digits = 2)
+          se_t2 = round(tabl['VAR:timesq', 'Std.Error'], digits = 2)
+          p_t2 = formatC(tabl['VAR:timesq', 'p-value'], format = "e", digits = 6)
+        }
+      }
+      
+      n_id = length(unique(mydata_long_temp$IID))
+      n_tot = nrow(mydata_long_temp)
+      n = paste0(n_tot, ' (', n_id, ')')
+      
+      
+      line = t(as.data.frame(
+        c(
+          d,
+          nameSex[whichSex + 1],
+          nVAR,
+          formu_temp,
+          rand,
+          n,
+          b,
+          se,
+          p,
+          b_t,
+          se_t,
+          p_t,
+          b_t2,
+          se_t2,
+          p_t2
+        )
+      ))
+      rownames(line) = NULL
+      colnames(line) = c(
+        'Phenotype',
+        'Sex',
+        'VAR',
+        'Formula',
+        'Random',
+        'NTot_NID',
+        'b_VAR',
+        'se_VAR',
+        'p_VAR',
+        'b_VARtime',
+        'se_VARtime',
+        'p_VARtime',
+        'b_timesq',
+        'se_timesq',
+        'p_timesq'
+      )
+      
+      
+      allResult_Final = rbind(allResult_Final, line)
+      
+    }
+    
+    
+  }
+  
+  saveRDS(allResult_Final,
+          paste0('/LMM_results/LMM.Final.', nameSex[whichSex + 1], addOn, '.rds'))
+}
+  
+```
+

@@ -1,0 +1,1428 @@
+---
+title: "GEE_BMI"
+output: html_document
+---
+
+This code was used in the analysis of Gamache et al. (2026) (https://link.springer.com/article/10.1007/s00125-026-06722-5). For the purpose of my analysis we did not use the sex-stratified results. 
+
+# _______________________________
+
+# Package
+```{r}
+library(nlme)
+library(lme4)
+library(geepack)
+library("tidyverse")
+library(reshape2)
+library(car)
+library(texreg)
+library(performance)
+```
+
+# _______________________________
+
+# Functions
+
+## Pre-process
+
+This function prepares the longitudinal data for GEE analyses by converting the visit indicator into a continuous time variable based on the mean age at each visit, removing observations with missing outcome values, and centering time at the earliest visit.
+
+```{r}
+prepareGEEData = function(mydata_long, phenotype, bySex =TRUE) {
+    allData=c()
+    for (i in unique(mydata_long$time)) { # For each visit
+      allData=rbind(allData,mydata_long[mydata_long$time==i,])
+      allData[allData$time == i, 'time'] = round(mean(allData[allData$time == i, 'age_yrs'], na.rm = TRUE), digits = 2)
+    }
+    
+    # Remove line with NA
+    mydata_long = allData[!is.na(allData[, phenotype]), ]
+    
+    # Put the time at 0
+    mydata_long$time = mydata_long$time - min(mydata_long$time) # Comment line when doing plots 
+    
+    # Finished the scaling
+    return(mydata_long)
+}
+
+```
+
+## Pre-process 
+
+This is another pre-process function for the analyses which contain environmental variables 
+
+```{r}
+scaleTheVariableAndRemoveOutlier = function(mydata_long, phenotype, bySex =TRUE) {
+    allData=c() # Will contain all the processed data
+    for (i in unique(mydata_long$time)) { # By visit
+        if (bySex == TRUE) {
+            # Male
+            dataM=mydata_long[mydata_long$time == i & mydata_long$sex==1,] # Extract male and this visit
+            dataM=dataM[!is.na(dataM[,phenotype]),] # Remove NA
+            meana = mean(dataM[, phenotype], na.rm = TRUE) # Get mean
+            sd = sd(dataM[, phenotype], na.rm = TRUE) # Get SD
+            
+            dataM=dataM[dataM[,phenotype]>= (meana - 5 * sd) & dataM[,phenotype]<= (meana + 5 * sd),]
+            dataM[,phenotype]=scale(dataM[,phenotype])
+            
+            allData=rbind(allData,dataM)
+           
+  
+            # Female
+            dataF=mydata_long[mydata_long$time == i & mydata_long$sex==2,]
+            dataF=dataF[!is.na(dataF[,phenotype]),]
+            meana = mean(dataF[, phenotype], na.rm = TRUE)
+            sd = sd(dataF[, phenotype], na.rm = TRUE)
+            
+            dataF=dataF[dataF[,phenotype]>= (meana - 5 * sd) & dataF[,phenotype]<= (meana + 5 * sd),]
+            
+            dataF[,phenotype]=scale(dataF[,phenotype])
+            
+            allData=rbind(allData,dataF)
+            
+        } else{
+            dataT=mydata_long[mydata_long$time == i,]
+            meana = mean(dataT[, phenotype], na.rm = TRUE)
+            sd = sd(dataT[, phenotype], na.rm = TRUE)
+            
+            dataT=dataT[dataT[,phenotype]>= (meana - 5 * sd) & dataT[,phenotype]<= (meana + 5 * sd),]
+            
+            dataT[,phenotype]=scale(dataT[,phenotype])
+            
+            allData=rbind(allData,dataT)
+        }
+        
+       allData[allData$time == i, 'time'] = round(mean(allData[allData$time == i, 'age_yrs'], na.rm = TRUE),digits=2)
+        
+        
+    }
+    
+    mydata_long = allData[!is.na(allData[,phenotype]), ]
+    mydata_long$time = mydata_long$time - min(mydata_long$time) 
+    
+    return(mydata_long)
+}
+
+```
+
+## Check 1: Mean outcome trajectory over time
+Calculate the mean outcome at each visit to assess the overall trajectory of the phenotype over time. This generates a plot, you need to verify if the mean across time seems constant. 
+
+```{r}
+check1_MeanAcrossTime <- function(mydata_long, phenotype) {
+  moy <- (aggregate(Phenotype ~ time, data = mydata_long, mean, na.rm = T))
+  colnames(moy)[2] = 'Phenotype' # outcome of interest
+  plot(
+    moy$time,
+    moy[, 'Phenotype'],
+    pch = 17,
+    xlab = 'Visit',
+    ylab = paste0(phenotype, ' z-score')
+  )
+  lines(moy$time, moy[, 'Phenotype'], lty = 2)
+  title(phenotype)
+}
+
+```
+
+## Check 2: Selection of the time trajectory
+Fit candidate linear models to determine whether the association between the phenotype and VAR changes linearly or non-linearly over time (time, time squared or interaction with time).
+
+```{r}
+check2_BestLinearModel <- function(mydata_long, allResult_S, var = 'NotSex', adjust_maternal_age = TRUE) {
+  
+  # Will keep in memory if the model was evaluated
+  smod1 = FALSE
+  smod2 = FALSE
+  smod3 = FALSE
+  smod4 = FALSE
+  
+  mod1 = NULL
+  mod2 = NULL
+  mod3 = NULL
+  mod4 = NULL
+  
+  # Define covariates
+  covariates <- c()
+  
+  # Add sex when analysis is not sex-stratified and VAR is not sex
+  if (whichSex == 0 && var != 'sex') {
+    covariates <- c(covariates, "sex")
+  }
+  
+  # Add maternal age when required (when the analysis is not child specific)
+  if (adjust_maternal_age) {
+    covariates <- c(covariates, "AgeDelivery_Mom")
+  }
+  
+  # Construct the covariate portion of the model
+  covariates <- if (length(covariates) > 0) {
+    paste(covariates, collapse = " + ")
+  } else { "" }
+  
+  # MODEL 1: Linear association with time
+  formula1 <- as.formula(
+      paste("Phenotype ~ VAR + time",
+            ifelse(covariates != "", paste("+", covariates), ""))
+    )  
+  mod1 <- glm(formula1, data = mydata_long, family=binomial)
+  smod1 = TRUE # This model was estimated
+
+  # MODEL 2: Add a quadratic time term 
+  # I(time^2) creates the squared time term directly within the model.
+  formula2 <- as.formula(
+    paste("Phenotype ~ VAR + time + I(time^2)",
+          ifelse(covariates != "", paste("+", covariates), ""))
+  )
+  mod2 <- glm(formula2, data = mydata_long, family=binomial)
+  smod2 = TRUE # This model was estimated
+  
+  # MODEL 3: Allow the effect of VAR to vary linearly over time
+  # The VAR * time interaction tests whether the association between VAR and the phenotype changes across visits.
+  formula3 <- as.formula(
+    paste("Phenotype ~ time * VAR + I(time^2)",
+          ifelse(covariates != "", paste("+", covariates), ""))
+  )
+  mod3 <- glm(formula3, data = mydata_long, family=binomial)
+  
+  # Determine whether the VAR × time interaction is statistically significant. Only if there is evidence that the effect of VAR changes over time do we proceed to the more complex Model 4.
+  
+  if (summary(mod3)$coefficient['time:VAR', 4] < 0.05) { # You only consider this if the term is significant.
+    smod3 = TRUE
+
+    # MODEL 4: Allow the effect of VAR to vary non-linearly over time
+    # Create a squared-time variable for use in Model 4.
+    mydata_long$timesq <- mydata_long$time^2
+    
+    formula4 <- as.formula(
+    paste("Phenotype ~ time * VAR + timesq * VAR",
+          ifelse(covariates != "", paste("+", covariates), ""))
+    )
+    mod4 <- glm(formula4, data = mydata_long, family=binomial)
+    
+    # Determine whether the VAR × time^2 interaction is statistically significant.
+    # If significant, Model 4 is retained as a candidate for BIC-based model selection. Otherwise, Model 4 is excluded.
+    if (summary(mod4)$coefficient['VAR:timesq', 4] < 0.05) { 
+      smod4 = TRUE
+      bic = BIC(mod1, mod2, mod3, mod4) 
+      best_model_linear = rownames(bic[which.min(bic$BIC), ]) 
+    } else{
+      bic = BIC(mod1, mod2, mod3)
+      best_model_linear = rownames(bic[which.min(bic$BIC), ]) 
+    }
+  } else{
+    bic = BIC(mod1, mod2)
+    best_model_linear = rownames(bic[which.min(bic$BIC), ]) 
+  }
+  
+  # Store the BIC value for each model. Models that were not evaluated will have NA because they are absent
+  # from the BIC table.
+  
+  bmod1 = bic['mod1', 'BIC']
+  bmod2 = bic['mod2', 'BIC']
+  bmod3 = bic['mod3', 'BIC']
+  bmod4 = bic['mod4', 'BIC']
+  
+  allResult_S$bic_mod1 = bmod1
+  allResult_S$bic_mod2 = bmod2
+  allResult_S$bic_mod3 = bmod3
+  allResult_S$bic_mod4 = bmod4
+  
+  # Conserve all informations obtain from this function in the table, this will be used in other function
+  allResult_S$best_linear_model = best_model_linear
+  
+  # Compile all informations and return them
+  out = list(
+    allResult_S = allResult_S,
+    smod1 = smod1,
+    smod2 = smod2,
+    smod3 = smod3,
+    smod4 = smod4,
+    mod1 = mod1,
+    mod2 = mod2,
+    mod3 = mod3,
+    mod4 = mod4
+  )
+  return(out)
+}
+
+```
+
+
+## Check 3: Predictions from candidate models
+Generate predicted phenotype values from each candidate model evaluated in Check 2 and compare them with the observed mean phenotype trajectory across visits. Predictions are generated only for models that were successfully fitted. The resulting plot shows how well each model captures the observed phenotype trajectory over time.
+
+```{r}
+check3_Prediction <- function(mydata_long, smod1, smod2, smod3, smod4, mod1, mod2, mod3, mod4, var='NotSex') {
+  
+  # If not sex-stratified or if the factor is the not sex, we will add sex to the models
+  if (whichSex != 0 || var == 'sex') {
+    datapred = mydata_long %>% drop_na(c("VAR", "Phenotype", "time"))
+  } else{
+    datapred = mydata_long %>% drop_na(c("VAR", "Phenotype", "time", "sex"))
+  }
+  
+  
+ # smod1–smod4 indicate whether the corresponding model was fitted.
+  if (smod1)
+    datapred$p1 <- predict(mod1, newdata = datapred)
+  if (smod2)
+    datapred$p2 <- predict(mod2, newdata = datapred)
+  if (smod3)
+    datapred$p3 <- predict(mod3, newdata = datapred)
+  if (smod4)
+    datapred$p4 <- predict(mod4, newdata = datapred)
+  
+  # Calculate the observed mean phenotype at each visit
+  par(mfrow = c(1, 1))
+  
+  moy <- aggregate(Phenotype ~ VAR + time, data = mydata_long, mean, na.rm = T)
+  colnames(moy)[3] = 'Phenotype'
+  
+   # Plot the observed mean phenotype trajectory.
+  plot(
+    moy$time,
+    moy$Phenotype,
+    pch = 4,
+    xlab = 'Visit',
+    ylab = paste0(phenotype, ' z-score')
+  )
+  
+  lines(moy$time, moy$Phenotype, lty = 3, col = 1)
+  
+  last = 1
+  # mod1
+  if (smod1) {
+    points(datapred$time, datapred$p1, col = 2)
+    lines(datapred$time, datapred$p1, lty = 3, col = 2)
+    last = 2
+  }
+  
+  # mod2
+  if (smod2) {
+    points(datapred$time, datapred$p2, col = 3)
+    lines(datapred$time, datapred$p2, lty = 3, col = 3)
+    last = 3
+  }
+  
+  # mod3
+  if (smod3) {
+    points(datapred$time, datapred$p3, col = 4)
+    lines(datapred$time, datapred$p3, lty = 3, col = 4)
+    last = 4
+  }
+  
+  # mod4
+  if (smod4) {
+    points(datapred$time, datapred$p4, col = 5)
+    lines(datapred$time, datapred$p4, lty = 3, col = 5)
+    last = 5
+  }
+  
+  legend(
+    'bottomright',
+    col = 1:last,
+    lty = 1,
+    legend = c("Mean", "Linear", "Quadratic", "VAR*Time", "VAR*Time2")[1:last]
+  )
+  return(datapred)
+}
+```
+
+## GEE - Extract results
+This function fits two GEE models using the model specifications selected in the previous steps: one model without the exposure-by-time interaction and one model including the interaction.
+
+```{r}
+
+extract_results <-function(allResult,allResult_S,mydata_long, formula, formula2, best_model_linear){
+
+  
+  # ==============================
+  # 1. Get all variables needed
+  formula_vars <- unique(c(all.vars(as.formula(formula)), 
+                           all.vars(as.formula(formula2)), "IID"))
+
+  # 2. Remove NAs FIRST
+  mydata_clean <- na.omit(mydata_long[, formula_vars])
+  
+  # 3. THEN rank and order
+  mydata_clean$IID = dplyr::min_rank(mydata_clean$IID)
+  mydata_clean = mydata_clean[order(mydata_clean$IID), ]
+  
+  # ==============================
+  
+  m1_cont <- geeglm(
+    as.formula(formula),
+    data = mydata_clean, # before it was mydata_long
+    id = IID,
+    family = binomial,
+    corstr = "exchangeable"
+  )
+  
+  m1_int <- geeglm(
+    as.formula(formula2),
+    data = mydata_clean,
+    id = IID,
+    family = binomial,
+    corstr = "exchangeable"
+  )
+  
+  #summarize an lme object (gets beta hat, se, t-value, p-value for fixed effects)
+  outputm1 <- (texreg::extract(m1_cont))
+  tabl = data.frame(Name=attr(outputm1,'coef.names'),Value=attr(outputm1,'coef'),Std.Error=attr(outputm1,'se'),p.value=attr(outputm1,'pvalues'))
+  rownames(tabl)=tabl$Name
+  tabl
+  
+  # summarize a lme object (gets beta hat, se, t-value, p-value for fixed effects)
+  outputm1 <- (texreg::extract(m1_int))
+  tabl_int = data.frame(Name=attr(outputm1,'coef.names'),Value=attr(outputm1,'coef'),Std.Error=attr(outputm1,'se'),p.value=attr(outputm1,'pvalues'))
+  rownames(tabl_int)=tabl_int$Name
+  tabl_int
+  
+  # Extract results from the table, depending on the best fitting models. 
+  if (best_model_linear %in% c('mod1', 'mod2')) {
+    allResult_S$formula_cont = formula # Will keep the formula of the model WITHOUT interaction
+    
+    # Get the VAR association results WITHOUT interaction
+    allResult_S$VAR_cont_b = tabl['VAR', 'Value'] 
+    allResult_S$VAR_cont_se = tabl['VAR', 'Std.Error']
+    allResult_S$VAR_cont_p = tabl['VAR', 'p.value']
+    
+    ##########
+    # Get results from interaction
+    allResult_S$formula_int = formula2
+    
+    # Get the VAR association results WITHOUT interaction, from the models WITH time-interaction
+    allResult_S$VAR_int_b = tabl_int['VAR', 'Value']
+    allResult_S$VAR_int_se = tabl_int['VAR', 'Std.Error']
+    allResult_S$VAR_int_p = tabl_int['VAR', 'p.value']
+    
+    # Get the VAR*time association from the models WITH time-interaction
+    allResult_S$VARtime_int_b = tabl_int['VAR:time', 'Value']
+    allResult_S$VARtime_int_se = tabl_int['VAR:time', 'Std.Error']
+    allResult_S$VARtime_int_p = tabl_int['VAR:time', 'p.value']
+    
+    # Not applicable for this models, but need the column
+    allResult_S$VARtime2_int_b = NA
+    allResult_S$VARtime2_int_se = NA
+    allResult_S$VARtime2_int_p = NA
+    
+  } else if (best_model_linear %in% c('mod3')) { # Never tested, but really similar to above, but we switch formula and formula2 since the interaction is present in formula, but not formula2
+    allResult_S$formula_cont = formula
+    
+    # Get VAR results without time-interaction
+    allResult_S$VAR_cont_b = tabl['VAR', 'Value']
+    allResult_S$VAR_cont_se = tabl['VAR', 'Std.Error']
+    allResult_S$VAR_cont_p = tabl['VAR', 'p.value']
+    
+    #################
+    # Formula with VAR*time interaction
+    allResult_S$formula_int = formula2
+    
+    # Get VAR results WITHOUT interaction from model WITH time interaction
+    allResult_S$VAR_int_b = tabl_int['VAR', 'Value']
+    allResult_S$VAR_int_se = tabl_int['VAR', 'Std.Error']
+    allResult_S$VAR_int_p = tabl_int['VAR', 'p.value']
+    
+    # Extract VAR*time results
+    allResult_S$VARtime_int_b = tabl_int['VAR:time', 'Value']
+    allResult_S$VARtime_int_se = tabl_int['VAR:time', 'Std.Error']
+    allResult_S$VARtime_int_p = tabl_int['VAR:time', 'p.value']
+    
+    # Not applicable for this models
+    allResult_S$VARtime2_int_b = NA
+    allResult_S$VARtime2_int_se = NA
+    allResult_S$VARtime2_int_p = NA
+    
+  } else if (best_model_linear %in% c('mod4')) { # The more complex model
+    
+    # Will extract the VAR result from the simplest formula of the two models
+    allResult_S$formula_cont = formula2
+    allResult_S$VAR_cont_b = tabl['VAR', 'Value']
+    allResult_S$VAR_cont_se = tabl['VAR', 'Std.Error']
+    allResult_S$VAR_cont_p = tabl['VAR', 'p.value']
+    
+    #############
+    # Complex models
+    allResult_S$formula_int = formula
+    
+    # VAR WITHOUT interaction from the model WITH interaction
+    allResult_S$VAR_int_b = tabl_int['VAR', 'Value']
+    allResult_S$VAR_int_se = tabl_int['VAR', 'Std.Error']
+    allResult_S$VAR_int_p = tabl_int['VAR', 'p.value']
+    
+    # VAR*time interaction form the model WITH interaction
+    allResult_S$VARtime_int_b = tabl_int['VAR:time', 'Value']
+    allResult_S$VARtime_int_se = tabl_int['VAR:time', 'Std.Error']
+    allResult_S$VARtime_int_p = tabl_int['VAR:time', 'p.value']
+    
+    # VAR*time2 interaction
+    allResult_S$VARtime2_int_b = tabl_int['VAR:timesq', 'Value']
+    allResult_S$VARtime2_int_se = tabl_int['VAR:timesq', 'Std.Error']
+    allResult_S$VARtime2_int_p = tabl_int['VAR:timesq', 'p.value']
+  }
+  
+  # combine
+  allResult = rbind(allResult, allResult_S)
+  
+  return(allResult)
+}
+```
+
+## Helper function getColumn()
+This function extracts the selected environmental variable from the original dataset, formats it according to the available measurement visits, and merges it with the longitudinal outcome dataset.
+
+```{r}
+getColumn <- function(mydata_long, var, age) {
+  
+  # Identify all columns corresponding to the environmental variable.
+  allEnv = colnames(df)[grep(var, colnames(df))] 
+  
+  # Select variables for child analyses.
+  if (age == 'Child') {
+    
+    if (!grepl('Mom', var) & sum(grepl('Mom', allEnv) != 0)) {
+      allEnv = allEnv[-grep('Mom', allEnv)]
+    }
+    
+    # This will be specific to your dataset.
+    # Remove variables that do not correspond to the required measurement visits or should otherwise be excluded.
+    allEnv = allEnv[!(
+      allEnv %in% c(
+        'PredictedEnergyIntakeKCAL_3yrs',
+        'MPVAsedentary_F13',
+        'MPVAmvpa_F13',
+        'MVPAcpm_F13',
+        'T_Townsend_32weeksPREG',
+        'T_Townsend_F11',
+        'T_Townsend_8mtns',
+        'T_Townsend_F11',
+        'rbmi_Mom',
+        'impedance_F7',
+        'impedance_F9',
+        'impedance_F11'
+      )
+    )]
+    
+  } else{
+    # Select variables for maternal analyses.
+    allEnv = allEnv[grep('Mom', allEnv)]
+    df2 = df[, c('IID', allEnv)]
+  
+    # Rename to a clean name
+    colnames(df2)[2] = var
+    
+    # Now merge directly (no reshaping needed)
+    mydata_long = merge(mydata_long, df2, by = "IID", all.x = TRUE)
+    
+    return(mydata_long)
+  }
+  
+  # Extract the IID and all environmental column
+  df2 = df[, c('IID', allEnv)]
+  
+  
+  # Standardise environmental variable names across visits.
+  # Environmental variables may have been measured at different visits. The following conditions rename the available measurements to the corresponding outcome visit and, where necessary, carry measurements forward to subsequent visits.
+  if (length(allEnv) > 1) {
+    # Special case: frequency of sweet fruit juice consumption.
+    # F9 is used for the age-7 outcome and F11 is used for age 15, 18 and 24 outcomes.
+    if (var == 'FreqDrinkSweetFruitJuice') {
+      
+      df2 = df2 %>% dplyr::rename(
+        "FreqDrinkSweetFruitJuice.7" = "FreqDrinkSweetFruitJuice_F9",
+        "FreqDrinkSweetFruitJuice.15" = "FreqDrinkSweetFruitJuice_F11"
+      )
+      df2$FreqDrinkSweetFruitJuice.18 = df2$FreqDrinkSweetFruitJuice.15
+      df2$FreqDrinkSweetFruitJuice.24 = df2$FreqDrinkSweetFruitJuice.15
+      
+      
+     # Variables measured at F7 and F13. # F7 is used for the age-7 outcome and F13 is used for age 15,
+    # 18 and 24 outcomes.
+    } else if (length(allEnv) == 2 & sum(grepl('F7|F13', allEnv)) == 2) { 
+      
+      colnames(df2)[colnames(df2) == paste0(var, "_F7")] = paste0(var, ".7")
+      colnames(df2)[colnames(df2) == paste0(var, "_F13")] = paste0(var, ".15")
+      df2[, paste0(var, ".18")] = df2[, paste0(var, ".15")]
+      df2[, paste0(var, ".24")] = df2[, paste0(var, ".15")]
+     
+    # Variables measured at F7 and F9.
+    # F7 is used for the age-7 outcome and F9 is used for age 15, 18 and 24 outcomes. 
+    } else if (length(allEnv) == 2 & sum(grepl('F7|F9', allEnv)) == 2) { # Measured at F7 and F9
+      colnames(df2)[colnames(df2) == paste0(var, "_F7")] = paste0(var, ".7")
+      colnames(df2)[colnames(df2) == paste0(var, "_F9")] = paste0(var, ".15")
+      df2[, paste0(var, ".18")] = df2[, paste0(var, ".15")]
+      df2[, paste0(var, ".24")] = df2[, paste0(var, ".15")]
+    
+    # Variables measured at F11 and F15.
+    # The F11 measurement is assigned to the baseline outcome visit and F15 is used for the later outcome visits.
+    } else if (length(allEnv) == 2 & sum(grepl('F11|F15', allEnv)) == 2) { 
+
+      colnames(df2)[colnames(df2) == paste0(var, "_F11")] = paste0(var, ".0")
+      colnames(df2)[colnames(df2) == paste0(var, "_F15")] = paste0(var, ".15")
+      df2[, paste0(var, ".18")] = df2[, paste0(var, ".15")]
+      df2[, paste0(var, ".24")] = df2[, paste0(var, ".15")]
+    
+    # Variables measured at the same four outcome visits.  
+    } else if (length(allEnv) == 4 & sum(grepl('F7|F15|F18|F24', allEnv)) == 4) { # Only the same visit, will just change the _F for .
+      colnames(df2)[colnames(df2) == paste0(var, "_F7")] = paste0(var, ".7")
+      colnames(df2)[colnames(df2) == paste0(var, "_F15")] = paste0(var, ".15")
+      colnames(df2)[colnames(df2) == paste0(var, "_F18")] = paste0(var, ".18")
+      colnames(df2)[colnames(df2) == paste0(var, "_F24")] = paste0(var, ".24")
+    
+    # Special case: household income quintile.
+    } else if (var == 'T_Income_Quintile') { # Special one
+      colnames(df2)[colnames(df2) == paste0(var, "_2000")] = paste0(var, ".7")
+      colnames(df2)[colnames(df2) == paste0(var, "_2004")] = paste0(var, ".15")
+      colnames(df2)[colnames(df2) == paste0(var, "_2007")] = paste0(var, ".18")
+      colnames(df2)[colnames(df2) == paste0(var, "_2010")] = paste0(var, ".24")
+    
+    # Variables measured at F13, F15 and F18.
+    # F13 is assigned to the age-7 outcome, F15 to age 15 and F18 is carried forward to the age-24 outcome.
+    } else if (length(allEnv) == 3 & sum(grepl('F13|F15|F18', allEnv)) == 3) { 
+      colnames(df2)[colnames(df2) == paste0(var, "_F13")] = paste0(var, ".0")
+      colnames(df2)[colnames(df2) == paste0(var, "_F15")] = paste0(var, ".15")
+      colnames(df2)[colnames(df2) == paste0(var, "_F18")] = paste0(var, ".18")
+      df2[, paste0(var, ".24")] = df2[, paste0(var, ".18")]
+    
+    # Variables measured at F7, F15 and F18.
+    # F7 is used for the age-7 outcome, F15 for age 15 and F18 is carried forward to the age-24 outcome.
+    } else if (length(allEnv) == 3 & sum(grepl('F7|F15|F18', allEnv)) == 3) { # Visit at F7, F15, F18
+      colnames(df2)[colnames(df2) == paste0(var, "_F7")] = paste0(var, ".7")
+      colnames(df2)[colnames(df2) == paste0(var, "_F15")] = paste0(var, ".15")
+      colnames(df2)[colnames(df2) == paste0(var, "_F18")] = paste0(var, ".18")
+      df2[, paste0(var, ".24")] = df2[, paste0(var, ".18")]
+    } 
+    
+  } else if (var != 'ProcessedDietScore') { # If only one environmental factor, will copy for each visit
+    colnames(df2)[colnames(df2) == allEnv] = paste0(var, ".7")
+    df2[, paste0(var, ".15")] = df2[, paste0(var, ".7")]
+    df2[, paste0(var, ".18")] = df2[, paste0(var, ".7")]
+    df2[, paste0(var, ".24")] = df2[, paste0(var, ".7")]
+  }
+  
+ # Special case: processed diet score.
+ if (var == 'ProcessedDietScore') {
+    colnames(df2)[colnames(df2) == paste0(var, "_F13")] = paste0(var, ".13")
+    df2[, paste0(var, ".15")] = df2[, paste0(var, ".13")]
+    df2[, paste0(var, ".18")] = df2[, paste0(var, ".13")]
+    df2[, paste0(var, ".24")] = df2[, paste0(var, ".13")]
+  }
+    
+  # Check if any column contains ".0 or .13"
+  if(any(grepl("\\.0$|\\.13$", colnames(df2)))){
+    df2 <- df2[, !grepl("(\\.0$|\\.13$|\\.7$|_.*7$)", colnames(df2))]
+  }
+    
+  df2 <- df2 %>% rename_with(~ sub("_F", ".", .x))
+  phenotype_cols <- grep(paste0("^", phenotype, "\\."), colnames(df2), value = TRUE)
+  new_names <- sub(paste0("^", phenotype), "Phenotype", phenotype_cols)
+  df2 <- df2 %>% rename_at(vars(all_of(phenotype_cols)), ~ new_names)
+
+  mydata_long2 = reshape(
+    df2,
+    idvar = "IID",
+    sep = ".",
+    varying = colnames(df2)[grep('.', colnames(df2), fixed = TRUE)],
+    direction = "long"
+  )
+ 
+  # Remove the time column, since it will be duplicated during the merge
+  mydata_long2 = mydata_long2[, !(colnames(mydata_long2) %in% c('time'))]
+  
+  # The rownames is the same : ID.Visit, so we merge by this
+  mydata_long = merge(mydata_long, mydata_long2, by = 0, sort = FALSE)
+  rownames(mydata_long) = mydata_long[, 1] # The merge will remove the rownames and put it in the first column. I don't want that for the next merge! So keep it as rownames and remove the new column
+  mydata_long = mydata_long[, -1]
+  
+  # Since the IID column is present in both, I will remove the duplicated and rename (IID.x to IID)
+  mydata_long = mydata_long[, !(colnames(mydata_long) %in% c('IID.y'))]
+  colnames(mydata_long)[1] = 'IID'
+  
+  return(mydata_long)
+
+}
+```
+
+# _______________________________
+# Main Script 
+## Data preprocessing 
+
+```{r}
+df=readRDS('processed_pheno.rds')
+
+# Keep only the child
+df$IID <- df$IID_child
+df=df[grep('A',df$IID),]
+
+# Binary outcomes 
+t2dVariable=c('dysglycemie','InsulinResistance') 
+
+# My exposure name 
+columnBMI = 'prepreg_bmi'
+
+# Creating phenotype (outcome) and exposure dataframe
+all_pheno_bmi = data.frame(
+  Factor = rep(columnBMI, 2),
+  Phenotype = c('dysglycemie', 'InsulinResistance')
+)
+
+# Creating data frame with phenotype (outcome) and child covariates of interest  
+Env_Child <- data.frame(
+   Factor = c('FreqDrinkSweetFruitJuice','HealthAwareScore', 'ProcessedDietScore', 'MPVAmvpa', 'MPVAsedentary', 'impedance', 'T_Income_Quintile', 'T_Townsend'),
+  Phenotype = c(rep('dysglycemie', 8), rep('InsulinResistance', 8))
+  )
+
+# Creating data frame with phenotype (outcome) and mother covariates of interest  
+Env_Mom <- data.frame(
+   Factor = c('ConfectionaryDietScore_32weeksPREG_Mom','ProcessedDietScore_32weeksPREG_Mom','VegetarianDietScore_32weeksPREG_Mom','PhysicalActivity_PREG_Mom', 'TobaccoSmokedREG_EndPREG_Mom', 'TobaccoSmokedREG_1to3mtnsPREG_Mom', 'TobaccoSmokedREG_PrePREG_Mom'),
+  Phenotype = c(rep('dysglycemie', 7), rep('InsulinResistance', 7))
+  )
+
+
+```
+
+## GEE: Base covariates 
+
+This section runs the complete GEE analysis for each exposure–outcome pair and separately for the combined-sex, male, and female analyses. It includes only base covariates (sex of the child and the mother's age at delivery)
+
+```{r}
+
+for (whichSex in 0:2) {#0 = mixte, 1=male, 2=female
+  nameSex = c('Mixte', 'Male', 'Female')
+  
+  whichResultName = paste0('/GEE_results/GEE.Base.', nameSex[whichSex + 1], '.rds') # Name for the results outcome file
+  
+  allResult = NULL
+ 
+  for (j in 1:nrow(all_pheno_bmi)) { # For each pair of VAR-outcome from the table defined above
+    
+    var = all_pheno_bmi[j, 1] # Extract VAR
+    phenotype = all_pheno_bmi[j, 2] # Extract outcome
+
+    # Result 
+    allResult_S = t(as.data.frame(c(var, phenotype)))
+    colnames(allResult_S) = c('VAR', 'Phenotype')
+    allResult_S = as.data.frame(allResult_S)
+    
+   
+    df2 = df[, c(
+      'IID',
+      var, 
+      paste0('age_yrs_', c('F7', 'F15', 'F18', 'F24')),
+      paste0(phenotype, '_', c('F7', 'F15', 'F18', 'F24')),
+      'sex',
+      'AgeDelivery_Mom'
+    )]
+    
+    
+    # Rename repeated-measures variables to a common format for reshaping
+    df2 = df2 %>% dplyr::rename(
+      "age_yrs.7" = "age_yrs_F7",
+      "age_yrs.15" = "age_yrs_F15",
+      "age_yrs.18" = "age_yrs_F18",
+      "age_yrs.24" = "age_yrs_F24",
+      "Phenotype.7" = paste0(phenotype, "_F7"),
+      "Phenotype.15" = paste0(phenotype, "_F15"),
+      "Phenotype.18" = paste0(phenotype, "_F18"),
+      "Phenotype.24" = paste0(phenotype, "_F24")
+    )
+    
+    # Rename the exposure to VAR for consistency across models
+    colnames(df2)[colnames(df2) == var] = 'VAR' # Will be easier for regression
+    
+    # Reshape the repeated-measures data from wide to long format
+    mydata_long = reshape(
+      df2,
+      idvar = "IID", # Shared variable across visit
+      sep = ".", # Separator
+      varying = colnames(df2)[grep('.', colnames(df2), fixed = TRUE)], # Which variable is not constant across visit
+      direction = "long"
+    )
+    # Remove observations with missing outcome values
+    mydata_long = mydata_long[!is.na(mydata_long$Phenotype), ] # Remove NA
+    
+    # Create the quadratic time term for candidate models
+    mydata_long$timesq <- mydata_long$time^2
+    
+    mydata_long = prepareGEEData(mydata_long, 'Phenotype')
+    
+    if (whichSex != 0) { # If sex-stratified, only keep one sex and remove column sex
+      mydata_long = mydata_long[mydata_long$sex == whichSex, ]
+      mydata_long = mydata_long[, !(colnames(mydata_long) %in% 'sex')]
+    }
+
+    id = length(unique(colsplit(rownames(na.omit(mydata_long)) , '\\.', c('A', 'B'))$A)) # Count the number of unique individual
+    allResult_S$N_id = paste0(nrow(na.omit(mydata_long)), ' (', id, ')') # Count the number of observation
+    
+    
+    
+    #################################################################
+    check1_MeanAcrossTime(mydata_long, phenotype)
+    
+    #################################################################
+    out = check2_BestLinearModel(mydata_long, allResult_S)
+  
+    allResult_S = out$allResult_S
+    best_model_linear = allResult_S$best_linear_model
+    smod1 = out$smod1
+    smod2 = out$smod2
+    smod3 = out$smod3
+    smod4 = out$smod4
+    
+    mod1 = out$mod1
+    mod2 = out$mod2
+    mod3 = out$mod3
+    mod4 = out$mod4
+  
+    # Define the GEE model formulas according to the best-fitting time structure identified above.
+    if(best_model_linear=='mod1'){
+      formula='Phenotype ~ VAR + time + AgeDelivery_Mom'
+      formula2='Phenotype ~ VAR * time + AgeDelivery_Mom'
+    }else if(best_model_linear=='mod2'){
+      formula='Phenotype ~ VAR + time + timesq + AgeDelivery_Mom'
+      formula2='Phenotype ~ VAR * time + timesq + AgeDelivery_Mom'
+      mydata_long$timesq=mydata_long$time*mydata_long$time
+    }else if(best_model_linear=='mod3'){
+      formula='Phenotype ~ VAR + time + timesq + AgeDelivery_Mom'
+      formula2='Phenotype ~ VAR * time + timesq + AgeDelivery_Mom'
+      mydata_long$timesq=mydata_long$time*mydata_long$time
+    }else if(best_model_linear=='mod4'){
+      formula='Phenotype ~ VAR * time + timesq + AgeDelivery_Mom'
+      formula2='Phenotype ~ VAR * time + VAR * timesq + AgeDelivery_Mom'
+      mydata_long$timesq=mydata_long$time*mydata_long$time
+    }
+    
+    if (whichSex == 0) {
+      formula=paste0(formula,' + sex')
+      formula2=paste0(formula2,' + sex')
+    }
+  
+    #################################################################
+    # Fit the GEE models and extract results 
+    allResult = extract_results(
+      allResult,
+      allResult_S,
+      mydata_long,
+      formula,
+      formula2,
+      best_model_linear
+    )
+    allResult = unique(allResult)
+    
+    
+  }
+  
+  saveRDS(allResult, whichResultName)
+  dev.off()
+}
+```
+
+## GEE: Env variables - child 
+
+This section runs the complete GEE analysis for each child covariate–outcome pair and separately for the combined-sex, male, and female analyses.
+```{r}
+nameSex = c('Mixte', 'Male', 'Female')
+for(whichSex in 0:2){#0 = mixte, 1=male, 2=female
+  # Name of the result file
+
+  whichResultName = paste0('/GEE_results/GEE.env.child.', nameSex[whichSex + 1], '.rds') # Name for the results outcome file
+  
+  allResult = NULL
+  
+  for (j in 1:nrow(Env_Child)) { 
+    var = Env_Child[j, 1] # Extract factor
+    phenotype = Env_Child[j, 2] # Extract outcome
+  
+    allResult_S = t(as.data.frame(c(var, phenotype)))
+    colnames(allResult_S) = c('VAR', 'Phenotype')
+    allResult_S = as.data.frame(allResult_S)
+
+    if (var == 'sex' && whichSex != 0) { 
+      next
+    }
+    
+    # Create outcome dataset
+    df2 = df[, c(
+      'IID',
+      paste0('age_yrs_', c('F7', 'F15', 'F18', 'F24')),
+      paste0(phenotype, '_', c('F7', 'F15', 'F18', 'F24')),
+      'sex'
+    )]
+    
+    # Rename outcome and age variables
+    df2 <- df2 %>%
+      rename_with(~ sub("_F", ".", .x))
+    
+    phenotype_cols <- grep(
+      paste0("^", phenotype, "\\."),
+      colnames(df2),
+      value = TRUE
+    )
+    
+    new_names <- sub(
+      paste0("^", phenotype),
+      "Phenotype",
+      phenotype_cols
+    )
+    
+    df2 <- df2 %>%  rename_at(vars(all_of(phenotype_cols)), ~ new_names)
+    
+    # Reshape outcome data
+    mydata_long = reshape(
+      df2,
+      idvar = "IID",
+      sep = ".",
+      varying = colnames(df2)[grep(".", colnames(df2), fixed = TRUE)],
+      direction = "long"
+    )
+    
+    # Remove missing outcomes
+    mydata_long = mydata_long[!is.na(mydata_long$Phenotype), ]
+    
+    # Add environmental variable
+    mydata_long = getColumn(mydata_long, var, "Child")
+      
+      
+    mydata_long = prepareGEEData(mydata_long, 'Phenotype')
+    
+    # Change the name of the factor for VAR, easier later
+    colnames(mydata_long)[grep(var, colnames(mydata_long))] = 'VAR'
+    mydata_long = mydata_long[!is.na(mydata_long$VAR), ]
+    
+    mydata_long$timesq <- mydata_long$time^2 # For a specific model
+    
+    
+    if (whichSex != 0) { # Sex-stratified analysis
+      mydata_long = mydata_long[mydata_long$sex == whichSex, ]
+      mydata_long = mydata_long[, !(colnames(mydata_long) %in% 'sex')]
+    }
+    
+    id = length(unique(colsplit(rownames(na.omit(mydata_long)) , '\\.', c('A', 'B'))$A)) # Count the number of unique individual
+    allResult_S$N_id = paste0(nrow(na.omit(mydata_long)), ' (', id, ')') # Count the number of observation
+    
+    
+    
+    #################################################################
+    # Check 1
+    check1_MeanAcrossTime(mydata_long, phenotype)
+
+    
+    #################################################################
+    # Check 2
+    out = check2_BestLinearModel(mydata_long, allResult_S, var, adjust_maternal_age = FALSE)
+    allResult_S = out$allResult_S
+
+    # Store the fitted models used to assess model fit and predictions.
+    best_model_linear = allResult_S$best_linear_model
+    smod1 = out$smod1
+    smod2 = out$smod2
+    smod3 = out$smod3
+    smod4 = out$smod4
+    
+    mod1 = out$mod1
+    mod2 = out$mod2
+    mod3 = out$mod3
+    mod4 = out$mod4
+    
+  
+    # Define the GEE model formulas according to the best-fitting time structure identified above.
+    if(best_model_linear=='mod1'){
+      formula='Phenotype ~ VAR + time'
+      formula2='Phenotype ~ VAR * time'
+    }else if(best_model_linear=='mod2'){
+      formula='Phenotype ~ VAR + time + timesq'
+      formula2='Phenotype ~ VAR * time + timesq'
+      mydata_long$timesq=mydata_long$time*mydata_long$time
+    }else if(best_model_linear=='mod3'){
+      formula='Phenotype ~ VAR + time + timesq'
+      formula2='Phenotype ~ VAR * time + timesq'
+      mydata_long$timesq=mydata_long$time*mydata_long$time
+    }else if(best_model_linear=='mod4'){
+      formula='Phenotype ~ VAR * time + timesq'
+      formula2='Phenotype ~ VAR * time + VAR * timesq'
+      mydata_long$timesq=mydata_long$time*mydata_long$time
+    }
+    
+    if (whichSex == 0 && var!='sex') {
+      formula=paste0(formula,' + sex')
+      formula2=paste0(formula2,' + sex')
+    }
+    
+    
+
+    
+    #################################################################
+    allResult = extract_results(
+      allResult,
+      allResult_S,
+      mydata_long,
+      formula,
+      formula2,
+      best_model_linear
+    )
+    allResult = unique(allResult)
+    
+  }
+  
+  saveRDS(allResult, whichResultName)
+  dev.off()
+}
+```
+
+## GEE: Env variables - mother 
+```{r}
+
+for(whichSex in 0:2){#0 = mixte, 1=male, 2=female
+  whichResultName = paste0('/GEE_results/GEE.env.mother.', nameSex[whichSex + 1], '.rds') # Name for the results outcome file
+  
+  allResult = NULL
+  
+  for (j in 1:nrow(Env_Mom)) {
+    var = Env_Mom[j, 1]
+    phenotype = Env_Mom[j, 2]
+    
+    
+    # Result 
+    allResult_S = t(as.data.frame(c(var, phenotype)))
+    colnames(allResult_S) = c('VAR', 'Phenotype')
+    allResult_S = as.data.frame(allResult_S)
+    
+    allEnv = colnames(df)[grep(var, colnames(df))]
+    allEnv = allEnv[grep('Mom', allEnv)] # ensure that it is only maternal variable
+    allEnv = allEnv[!(allEnv %in% c('rbmi_Mom'))]
+    
+    df2 = df[, c(
+      'IID',
+      allEnv,
+      paste0('age_yrs_', c('F7', 'F15', 'F18', 'F24')),
+      paste0(phenotype, '_', c('F7', 'F15', 'F18', 'F24')),
+      'sex',
+      'AgeDelivery_Mom'
+    )]
+    
+    
+    df2 = df2 %>% dplyr::rename(
+      "age_yrs.7" = "age_yrs_F7",
+      "age_yrs.15" = "age_yrs_F15",
+      "age_yrs.18" = "age_yrs_F18",
+      "age_yrs.24" = "age_yrs_F24",
+      "Phenotype.7" = paste0(phenotype, "_F7"),
+      "Phenotype.15" = paste0(phenotype, "_F15"),
+      "Phenotype.18" = paste0(phenotype, "_F18"),
+      "Phenotype.24" = paste0(phenotype, "_F24")
+    )
+    
+    mydata_long = reshape(
+      df2,
+      idvar = "IID",
+      sep = ".",
+      varying = colnames(df2)[grep('.', colnames(df2), fixed = TRUE)],
+      direction = "long"
+    )
+    mydata_long = mydata_long[!is.na(mydata_long$Phenotype), ]
+    mydata_long = prepareGEEData(mydata_long, 'Phenotype')
+    
+    colnames(mydata_long)[grep(var, colnames(mydata_long))] = 'VAR'
+    mydata_long = mydata_long[!is.na(mydata_long$VAR), ]
+    
+    mydata_long$timesq <- mydata_long$time^2
+    
+    
+    if (whichSex != 0) {
+      mydata_long = mydata_long[mydata_long$sex == whichSex, ]
+      mydata_long = mydata_long[, !(colnames(mydata_long) %in% 'sex')]
+    }
+  
+    id = length(unique(colsplit(rownames(na.omit(mydata_long)) , '\\.', c('A', 'B'))$A)) # Count the number of unique individual
+    allResult_S$N_id = paste0(nrow(na.omit(mydata_long)), ' (', id, ')') # Count the number of observation
+    
+    
+    
+    #################################################################
+    # Check 1
+    check1_MeanAcrossTime(mydata_long, phenotype)
+
+    
+    #################################################################
+    # Check 2
+    out = check2_BestLinearModel(mydata_long, allResult_S, var)
+
+    allResult_S = out$allResult_S
+    best_model_linear = allResult_S$best_linear_model
+    smod1 = out$smod1
+    smod2 = out$smod2
+    smod3 = out$smod3
+    smod4 = out$smod4
+    
+    mod1 = out$mod1
+    mod2 = out$mod2
+    mod3 = out$mod3
+    mod4 = out$mod4
+    
+    # Define the GEE model formulas according to the best-fitting time structure identified above
+    if(best_model_linear=='mod1'){
+      formula='Phenotype ~ VAR + time + AgeDelivery_Mom'
+      formula2='Phenotype ~ VAR * time + AgeDelivery_Mom'
+    }else if(best_model_linear=='mod2'){
+      formula='Phenotype ~ VAR + time + timesq + AgeDelivery_Mom'
+      formula2='Phenotype ~ VAR * time + timesq + AgeDelivery_Mom'
+      mydata_long$timesq=mydata_long$time*mydata_long$time
+    }else if(best_model_linear=='mod3'){
+      formula='Phenotype ~ VAR + time + timesq + AgeDelivery_Mom'
+      formula2='Phenotype ~ VAR * time + timesq + AgeDelivery_Mom'
+      mydata_long$timesq=mydata_long$time*mydata_long$time
+    }else if(best_model_linear=='mod4'){
+      formula='Phenotype ~ VAR * time + timesq + AgeDelivery_Mom'
+      formula2='Phenotype ~ VAR * time + VAR * timesq + AgeDelivery_Mom'
+      mydata_long$timesq=mydata_long$time*mydata_long$time
+    }
+    
+    if (whichSex == 0 && var!='sex') {
+      formula=paste0(formula,' + sex')
+      formula2=paste0(formula2,' + sex')
+    }
+    
+
+    
+    #################################################################
+    allResult = extract_results(
+      allResult,
+      allResult_S,
+      mydata_long,
+      formula,
+      formula2,
+      best_model_linear
+    )
+    allResult = unique(allResult)
+  }
+  
+  saveRDS(allResult, whichResultName)
+  dev.off()
+}
+```
+
+## GEE: Base + Env
+
+This will test all mom and child environmental variables that were significant (from previous analysis) and combine them together 
+
+```{r}
+
+for(whichSex in 0:2){
+  
+  ## For the naming be automatic
+  nameSex = c('Mixte', 'Male', 'Female')
+  
+  allResult_Final = c()
+  
+  withBMIcie = TRUE # Do we want BMI, impedance and fat percent in the multivariable?
+  
+  if (withBMIcie) {
+    addOn = '.WithBMIcie'
+  } else{
+    addOn = ''
+  }
+  
+  ## Bonferroni-corrected significance threshold
+  seuilP = 0.05 / 9
+  
+  
+  # Load results from the previous GEE analyses
+  ### Results from the VAR
+  whichResultName = paste0('/GEE_results/GEE.Base.', nameSex[whichSex + 1], '.rds')
+  resultVAR = readRDS(whichResultName)
+  
+  ### Results from the Environmental - child
+  whichResultName = paste0('/GEE_results/GEE.env.child.', nameSex[whichSex + 1], '.rds')
+  resultEnv = readRDS(whichResultName)
+  resultEnv$Age = 'Child'
+  
+  ### Results from the Environmental - Mom
+  whichResultName = paste0('/GEE_results/GEE.env.mother.', nameSex[whichSex + 1], '.rds')
+  resultEnvMom = readRDS(whichResultName)
+  resultEnvMom$Age = 'Mom'
+  
+  resultEnv = rbind(resultEnv, resultEnvMom)
+  
+  
+  ## Generate the environmental df for each outcome
+  for (d in t2dVariable) {
+    
+    # Extract results for current outcome
+    resultVAR_t = resultVAR[resultVAR$Phenotype == d, ]
+    resultEnv_t = resultEnv[resultEnv$Phenotype == d, ]
+    
+    
+    # Select environmental variables that were significant in the # previous analyses.
+    resultEnv_t = resultEnv_t[(resultEnv_t$best_linear_model %in% c('mod1','mod2') & resultEnv_t$VAR_cont_p < seuilP) | (resultEnv_t$best_linear_model %in% c('mod3','mod4') & resultEnv_t$VAR_int_p < seuilP) |  (resultEnv_t$best_linear_model %in% c('mod3','mod4') & resultEnv_t$VARtime_int_p < seuilP), ]
+    
+
+    
+    # Keep only the information needed to construct the ## multivariable model.
+    resultEnv_t_filt = resultEnv_t[, c('VAR', 'Age', 'best_linear_model')]
+    
+    if (withBMIcie) {
+      resultEnv_t_filt = resultEnv_t_filt[resultEnv_t_filt$VAR != 'sex', ] 
+    } else{
+      resultEnv_t_filt = resultEnv_t_filt[!grepl('Fat|bmi|imped', resultEnv_t_filt$VAR) & resultEnv_t_filt$VAR != 'sex', ] 
+    }
+    
+    ## Keep the selected base covariates and their best-fitting models
+    resultVAR_t_filt = resultVAR_t[, c('VAR', 'best_linear_model')]
+    
+    # Extract column for only basic variable/covariables
+    df2 = df[, c('IID',
+                 paste0('age_yrs_', c('F7', 'F15', 'F18', 'F24')),
+                 paste0(d, '_', c('F7', 'F15', 'F18', 'F24')),
+                 'AgeDelivery_Mom',
+                 'sex' )]
+    
+    # Rename the covaraite/outcome
+    df2 = df2 %>% dplyr::rename(
+      "age_yrs.7" = "age_yrs_F7",
+      "age_yrs.15" = "age_yrs_F15",
+      "age_yrs.18" = "age_yrs_F18",
+      "age_yrs.24" = "age_yrs_F24",
+      "Phenotype.7" = paste0(d, "_F7"),
+      "Phenotype.15" = paste0(d, "_F15"),
+      "Phenotype.18" = paste0(d, "_F18"),
+      "Phenotype.24" = paste0(d, "_F24")
+    )
+    
+    # Reshape 
+    mydata_long = reshape(
+      df2,
+      idvar = "IID",
+      sep = ".",
+      varying = colnames(df2)[grep('.', colnames(df2), fixed = TRUE)],
+      direction = "long"
+    )
+    ## Remove observations with a missing outcome
+    mydata_long = mydata_long[!is.na(mydata_long$Phenotype), ] 
+
+    mydata_long = prepareGEEData(mydata_long, 'Phenotype')
+    mydata_long$timesq <- mydata_long$time^2 # Create the quadratic time term
+    
+    mydata_long$IID = dplyr::min_rank(mydata_long$IID)
+    mydata_long = mydata_long[order(mydata_long$IID), ]
+    
+    
+    # # Add the significant environmental variables to the longitudinal dataset and standardise them.
+    if (nrow(resultEnv_t_filt) != 0) { 
+      for (f_p in 1:nrow(resultEnv_t_filt)) {
+        mydata_long = getColumn(mydata_long, resultEnv_t_filt[f_p, 'VAR'], resultEnv_t_filt[f_p, 'Age'])
+        mydata_long=scaleTheVariableAndRemoveOutlier(mydata_long,resultEnv_t_filt[f_p, 'VAR'])
+      }
+
+      colNames = colnames(mydata_long)
+      
+      # Check for collinearity among the environmental variables. 
+      colNames = colNames[!(
+        colNames %in% c(
+          'IID',
+          'Phenotype',
+          'AgeDelivery_Mom',
+          'age_yrs',
+          'sex',
+          'time',
+          'timesq'
+        )
+      )]
+      colNames_F = paste(colNames, collapse = ' + ') # Generate the formula containing all environmental factors
+      colNames_F = paste0('Phenotype ~ ', colNames_F) # Add the outcome to the formula
+      
+      m <- geeglm(
+        as.formula(colNames_F),
+        data = mydata_long,
+        id = IID,
+        family = binomial,
+        corstr = "exchangeable"
+      )
+      
+      
+      ## Remove environmental variables with VIF >= 5
+      vif_result = check_collinearity(m)
+      vif_result5 = vif_result[vif_result$VIF >= 5, "Term"]
+      colNames = colNames[!(colNames %in% vif_result5)]
+    } 
+    
+    # Prepare for GEE with VAR + Env
+    ## Generate the environmental formula
+    formu = c('Phenotype ~ time + AgeDelivery_Mom')
+    if (whichSex == 0) {
+      formu = paste0(formu, ' + sex')
+    }
+    
+    # Add each selected environmental variable to the model according # to its best-fitting longitudinal model.
+    if (nrow(resultEnv_t_filt) != 0) {
+      for (cN in colNames) {
+        best_model = resultEnv_t_filt[resultEnv_t_filt$VAR == cN, 'best_linear_model'] # Get which best model for the factor
+        if (best_model == 'mod1') {
+          formu = paste0(formu, ' + ', cN) # If it is mod1, only add the factor to the formula
+        } else if (best_model == 'mod4') {
+          formu = paste0(formu, ' + ', cN, '*time +', cN, '*timesq') # If the complex is the best, add interaction with time and time2
+        }else if (best_model == 'mod2') {
+          formu = paste0(formu, ' + ', cN) 
+          if(!grepl('timesq',formu)){
+            formu = paste0(formu, ' + timesq')
+          }
+        }else if(best_model=='mod3'){
+          formu = paste0(formu, ' + ', cN,'*time') 
+          if(!grepl('timesq',formu)){
+            formu = paste0(formu, ' + timesq')
+          }
+        }
+      }
+    }
+    
+    if(whichSex!=0){ # If sex-stratified
+      mydata_long=mydata_long[mydata_long$sex==whichSex,]
+      mydata_long=mydata_long[,!(colnames(mydata_long)=='sex')]
+    }
+
+    
+    # Fit a separate multivariable GEE model for each selected base covariate/VAR.
+    for (nVAR in resultVAR_t_filt$VAR) { # For each VAR
+      best_model_VAR = resultVAR_t_filt[resultVAR_t_filt$VAR == nVAR, 'best_linear_model']
+      
+      ## Start with the environmental/base-covariate model and add ## the current VAR according to it       best-fitting model.
+      formu_temp = formu 
+      if (best_model_VAR == 'mod1') {
+        formu_temp = gsub('~', '~ VAR +', formu_temp)
+      } else if (best_model_VAR == 'mod4') {
+        formu_temp = gsub('~', '~ VAR*time + VAR*timesq +', formu_temp)
+      } else if (best_model_VAR == 'mod2') {
+        formu_temp = paste0(formu_temp, ' + VAR')
+        if (!grepl('timesq', formu_temp)) {
+          formu_temp = paste0(formu_temp, ' + timesq')
+        }
+      } else if (best_model_VAR == 'mod3') {
+        formu_temp = paste0(formu_temp, ' + VAR*time')
+        if (!grepl('timesq', formu_temp)) {
+          formu_temp = paste0(formu_temp, ' + timesq')
+        }
+      }
+      
+      # Add the current base covariate to the data.
+      mydata_long_temp = mydata_long
+      mydata_long_temp$IID=colsplit(rownames(mydata_long_temp),'\\.',c('A','B'))$A # Recover the individual ID
+      df_VAR = df[, c('IID', nVAR)] # Add the VAR to the table
+      colnames(df_VAR)[2] = 'VAR'
+      mydata_long_temp = merge(mydata_long_temp, df_VAR, by = 'IID') # Merge
+      mydata_long_temp = na.omit(mydata_long_temp) # retain complete cases
+      
+      ## Re-index individuals and order the observations
+      mydata_long_temp$IID = dplyr::min_rank(mydata_long_temp$IID)
+      mydata_long_temp = mydata_long_temp[order(mydata_long_temp$IID), ] 
+      
+      # Fit the final multivariable GEE model.
+      best_total <- geeglm(
+        as.formula(formu_temp),
+        data = mydata_long_temp,
+        id = IID,
+        family = binomial,
+        corstr = "exchangeable"
+      )
+      
+      
+      # Aummarize an lme object (gets beta hat, se, t-value, p-value for fixed effects)
+      outputm1 <- (texreg::extract(best_total))
+      tabl = data.frame(
+        Name = attr(outputm1, 'coef.names'),
+        Value = attr(outputm1, 'coef'),
+        Std.Error = attr(outputm1, 'se'),
+        p.value = attr(outputm1, 'pvalues')
+      )
+      rownames(tabl) = tabl$Name
+      
+      # Extract result depending on the best models, again, only mod1 and mod4 in my case
+      b = round(tabl['VAR', 'Value'], digits = 6)
+      se = round(tabl['VAR', 'Std.Error'], digits = 6)
+      p = formatC(tabl['VAR', 'p.value'], format = "e", digits = 2)
+      
+      ## For models without a time interaction, interaction estimates are not applicable.
+      if (best_model_VAR %in% c('mod1','mod2')) {
+        b_t = NA
+        se_t = NA
+        p_t = NA
+        
+        b_t2 = NA
+        se_t2 = NA
+        p_t2 = NA
+      } else if (best_model_VAR == 'mod4') {
+        ## Extract the linear time interaction.
+        if (sum(rownames(tabl) == 'time:VAR') == 1) {
+          b_t = round(tabl['time:VAR', 'Value'], digits = 6)
+          se_t = round(tabl['time:VAR', 'Std.Error'], digits = 6)
+          p_t = formatC(tabl['time:VAR', 'p.value'], format = "e", digits = 6)
+        } else{
+          b_t = round(tabl['VAR:time', 'Value'], digits = 6)
+          se_t = round(tabl['VAR:time', 'Std.Error'], digits = 6)
+          p_t = formatC(tabl['VAR:time', 'p.value'], format = "e", digits = 6)
+        }
+        
+        ## Extract the quadratic time interaction.
+        if (sum(rownames(tabl) == 'timesq:VAR') == 1) {
+          b_t2 = round(tabl['timesq:VAR', 'Value'], digits = 6)
+          se_t2 = round(tabl['timesq:VAR', 'Std.Error'], digits = 6)
+          p_t2 = formatC(tabl['timesq:VAR', 'p.value'], format = "e", digits = 6)
+        } else{
+          b_t2 = round(tabl['VAR:timesq', 'Value'], digits = 2)
+          se_t2 = round(tabl['VAR:timesq', 'Std.Error'], digits = 2)
+          p_t2 = formatC(tabl['VAR:timesq', 'p.value'], format = "e", digits = 6)
+        }
+      }
+      
+      # Record the number of observations and unique individuals.
+      n_id = length(unique(mydata_long_temp$IID))
+      n_tot = nrow(mydata_long_temp)
+      n = paste0(n_tot, ' (', n_id, ')')
+      
+      # Store the results for the current outcome, sex, and VAR.
+      line = t(as.data.frame(
+        c(
+          d,
+          nameSex[whichSex + 1],
+          nVAR,
+          formu_temp,
+          n,
+          b,
+          se,
+          p,
+          b_t,
+          se_t,
+          p_t,
+          b_t2,
+          se_t2,
+          p_t2
+        )
+      ))
+      rownames(line) = NULL
+      colnames(line) = c(
+        'Phenotype',
+        'Sex',
+        'VAR',
+        'Formula',
+        'NTot_NID',
+        'b_VAR',
+        'se_VAR',
+        'p_VAR',
+        'b_VARtime',
+        'se_VARtime',
+        'p_VARtime',
+        'b_timesq',
+        'se_timesq',
+        'p_timesq'
+      )
+      allResult_Final = rbind(allResult_Final, line)
+    }
+    
+    
+  }
+  
+  saveRDS(allResult_Final,
+          paste0('/GEE_results/GEE.Full.', nameSex[whichSex + 1], addOn, '.rds'))
+}
+  
+```
+
